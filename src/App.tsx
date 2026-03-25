@@ -297,7 +297,11 @@ function buildApproachScenario(clubs: Club[], preferences: Preferences, windDir:
 
   const adjusted = clamp(base + targetAdjustment + windAdjustmentYards(base, windDir, windMph), 70, 210);
   const shot = preferences.preferredApproachShape as ShotType;
-  const correctClub = bestClubForDistance(clubs, adjusted, shot, { excludeWoods: true });
+  const correctClub = pickBestClubForYardage(
+  clubs.filter((c) => !["Driver", "3 Wood", "5 Wood"].includes(c.club)),
+  adjusted,
+  shot
+);
   const prompt = `Hole: Par ${par}, ${holeYardage} yards. Target: ${targetLabel}. Raw carry to the flag is ${base}. Wind: ${windLabel(windDir, windMph)}. Pin: ${pinLocation}. Green firmness: ${greenFirmness}. Main danger: ${danger}. Using miss-based strategy, what is the best play?`;
 
   return {
@@ -339,7 +343,11 @@ function buildClubSelectionScenario(clubs: Club[], preferences: Preferences, win
 
   const adjusted = clamp(carryNumber + targetAdjustment + windAdjustmentYards(carryNumber, windDir, windMph), 65, 205);
   const shot = preferences.preferredApproachShape as ShotType;
-  const club = bestClubForDistance(clubs, adjusted, shot, { excludeWoods: true });
+  const club = pickBestClubForYardage(
+  clubs.filter((c) => !["Driver", "3 Wood", "5 Wood"].includes(c.club)),
+  adjusted,
+  shot
+);
 
   return {
     mode: "strict",
@@ -404,7 +412,22 @@ function buildLayupScenario(clubs: Club[], preferences: Preferences, windDir: st
   const targetAdvance = Math.max(effective - favoriteWedge, 60);
   const shot = preferences.preferredLayupShape as ShotType;
   const club = bestClubForDistance(clubs, targetAdvance, shot);
+function pickBestClubForYardage(clubs: Club[], yardage: number, preferredShot: ShotType) {
+  let best = clubs[0];
+  let smallestDiff = Infinity;
 
+  for (const club of clubs) {
+    const carry = getClubValueForShot(club, preferredShot);
+    const diff = Math.abs(carry - yardage);
+
+    if (diff < smallestDiff) {
+      smallestDiff = diff;
+      best = club;
+    }
+  }
+
+  return best;
+}
   return {
     mode: "strict",
     type: "layup",
