@@ -201,7 +201,7 @@ function buildTeeScenario(clubs: Club[], preferences: Preferences, windDir: stri
   const driverTotal = getClubTotal(driver, preferredDriverShot === "stock" ? "stock" : preferredDriverShot);
   const layupClub = bestClubForDistance(clubs.filter((c) => !["Driver"].includes(c.club)), hazardStart - 18, preferences.preferredLayupShape);
   const layupCarry = getClubValueForShot(layupClub, preferences.preferredLayupShape);
-  const remainingIfDriver = holeYardage - driverTotal;
+  
   const remainingIfLayup = holeYardage - layupCarry;
 
   const severePenalty = severity === "high" || hazardKind === "water";
