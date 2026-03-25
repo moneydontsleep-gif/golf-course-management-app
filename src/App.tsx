@@ -124,8 +124,24 @@ function randomFrom<T>(arr: readonly T[]): T {
 function windAdjustmentYards(distance: number, windDir: string, mph: number) {
   const factor = distance / 100;
   if (windDir === "head") return Math.round(mph * 0.9 * factor);
-  if (windDir === "tail") return Math.round(mph * -0.5 * factor);
+  if (windDir === "tail") return Math.round(mph * -0.6 * factor);
   return 0;
+}
+
+function windTeachingText(windDir: string, adjusted: number, original: number) {
+  if (windDir === "head") {
+    return `Headwind adds effective yardage. The ball flies shorter, so the shot plays more like ${adjusted} instead of ${original}.`;
+  }
+  if (windDir === "tail") {
+    return `Tailwind helps the ball travel farther. That means the shot plays shorter, so the adjusted yardage becomes about ${adjusted} instead of ${original}.`;
+  }
+  if (windDir === "leftToRight") {
+    return `Left-to-right wind mostly changes drift and start line. The carry number stays closer to ${adjusted}, but the target and shape matter more.`;
+  }
+  if (windDir === "rightToLeft") {
+    return `Right-to-left wind mostly changes drift and curve. The carry number stays closer to ${adjusted}, but the target and shape matter more.`;
+  }
+  return `With calm conditions, the shot plays close to the base number of ${original}.`;
 }
 
 function windLabel(windDir: string, windMph: number) {
@@ -201,7 +217,7 @@ function buildTeeScenario(clubs: Club[], preferences: Preferences, windDir: stri
   const driverTotal = getClubTotal(driver, preferredDriverShot === "stock" ? "stock" : preferredDriverShot);
   const layupClub = bestClubForDistance(clubs.filter((c) => !["Driver"].includes(c.club)), hazardStart - 18, preferences.preferredLayupShape);
   const layupCarry = getClubValueForShot(layupClub, preferences.preferredLayupShape);
-  
+  const remainingIfDriver = holeYardage - driverTotal;
   const remainingIfLayup = holeYardage - layupCarry;
 
   const severePenalty = severity === "high" || hazardKind === "water";
@@ -291,11 +307,11 @@ function buildApproachScenario(clubs: Club[], preferences: Preferences, windDir:
     title: "Approach Decision",
     prompt,
     targetLabel,
-    adjustedYardageLabel: `Adjusted target about ${adjusted}`,
+    adjustedYardageLabel: `Adjusted yardage: ${adjusted}`,
     recommendation: `Hit a ${shot} with ${correctClub.club}`,
     correctClub: correctClub.club,
     correctShot: shot,
-    explanation: `The decision starts with the safest scoring target, not the flag by itself. Once the target is chosen, the yardage is adjusted for wind, firmness, and danger. Then the shot shape is chosen, and then the club.`,
+    explanation: `The decision starts with the safest scoring target, not the flag by itself. Once the target is chosen, the yardage is adjusted for wind, firmness, and danger. Then the shot shape is chosen, and then the club. ${windTeachingText(windDir, adjusted, base)}`,
     windDir,
     windMph,
     holeYardage,
@@ -332,11 +348,11 @@ function buildClubSelectionScenario(clubs: Club[], preferences: Preferences, win
     title: "Club Selection Trainer",
     prompt: `Hole: Par ${par}, ${holeYardage} yards. Target: ${targetLabel}. Carry to the original number is ${carryNumber}. Wind: ${windLabel(windDir, windMph)}. Pin: ${pinLocation}. Green firmness: ${greenFirmness}. Main danger: ${danger}. What is the best play?`,
     targetLabel,
-    adjustedYardageLabel: `Adjusted target about ${adjusted}`,
+    adjustedYardageLabel: `Adjusted yardage: ${adjusted}`,
     recommendation: `Hit a ${shot} with ${club.club}`,
     correctClub: club.club,
     correctShot: shot,
-    explanation: `This mode is built specifically to punish short and long club mistakes. The correct answer comes from target first, adjusted yardage second, shot third, and club last.`,
+    explanation: `This mode is built specifically to punish short and long club mistakes. The correct answer comes from target first, adjusted yardage second, shot third, and club last. ${windTeachingText(windDir, adjusted, carryNumber)}`,
     windDir,
     windMph,
     holeYardage,
@@ -701,9 +717,10 @@ export default function GolfCourseManagementQuizApp() {
                 <div className="stack">
                   <div className="soft">1. Choose the target first.</div>
                   <div className="soft">2. Adjust the yardage for wind, firmness, and danger.</div>
-                  <div className="soft">3. Choose the shot shape that best fits the target and miss pattern.</div>
-                  <div className="soft">4. Choose the club last.</div>
-                  <div className="soft">5. Punch shots use lower-lofted irons, not wedges.</div>
+                  <div className="soft">3. Tailwind makes the ball go farther, so the shot plays shorter and usually needs less club.</div>
+                  <div className="soft">4. Headwind makes the ball fly shorter, so the shot plays longer and usually needs more club.</div>
+                  <div className="soft">5. Choose the shot shape that best fits the target and miss pattern, then choose the club last.</div>
+                  <div className="soft">6. Punch shots use lower-lofted irons, not wedges.</div>
                 </div>
               </div>
             </div>
