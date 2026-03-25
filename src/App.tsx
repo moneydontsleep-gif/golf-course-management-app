@@ -10,7 +10,13 @@ import {
   Trash2,
   Trophy,
   Wind,
+  Map,
+  Ruler,
 } from "lucide-react";
+
+type ShotType = "draw" | "fade" | "knockdownFade" | "stock" | "punch";
+type ScenarioType = "tee" | "approach" | "layup" | "recovery" | "clubSelection";
+type HazardSeverity = "low" | "medium" | "high";
 
 type Club = {
   club: string;
@@ -24,9 +30,9 @@ type Club = {
 };
 
 type Preferences = {
-  preferredTeeShape: string;
-  preferredApproachShape: string;
-  preferredLayupShape: string;
+  preferredTeeShape: "fade" | "draw" | "stock";
+  preferredApproachShape: "knockdownFade" | "fade" | "stock" | "draw";
+  preferredLayupShape: "fade" | "stock" | "draw";
   allowDrawOffTee: boolean;
   strictMode: boolean;
   allowRecoveryFlexibility: boolean;
@@ -34,20 +40,32 @@ type Preferences = {
 };
 
 type Scenario = {
-  mode: string;
+  mode: "strict" | "recovery";
+  type: ScenarioType;
   category: string;
   title: string;
   prompt: string;
+  targetLabel: string;
+  adjustedYardageLabel: string;
   recommendation: string;
   correctClub: string;
-  correctShot: string;
+  correctShot: ShotType;
   explanation: string;
+  whyRisky?: string;
   windDir: string;
   windMph: number;
   holeYardage: number;
   par: number;
   targetYardage: number | null;
   distanceContext: string;
+};
+
+type Feedback = {
+  clubCorrect: boolean;
+  shotCorrect: boolean;
+  isCorrect: boolean;
+  missLabel?: string;
+  wrongReason?: string;
 };
 
 const defaultClubs: Club[] = [
@@ -84,18 +102,6 @@ const defaultClubs: Club[] = [
   { club: "LW", stock: 90, draw: 90, fade: 90, knockdownFade: 85 },
 ];
 
-const holeTemplates = [
-  { title: "Tee shot with fairway left", type: "tee" },
-  { title: "Tee shot with danger in landing area", type: "tee" },
-  { title: "Approach into a guarded green", type: "approach" },
-  { title: "Crosswind tee shot", type: "tee" },
-  { title: "Headwind approach", type: "approach" },
-  { title: "Par-5 layup decision", type: "layup" },
-  { title: "Missed fairway recovery", type: "recovery" },
-  { title: "Punch-out from trees", type: "recovery" },
-  { title: "Bad lie around trouble", type: "recovery" },
-] as const;
-
 const defaultPreferences: Preferences = {
   preferredTeeShape: "fade",
   preferredApproachShape: "knockdownFade",
@@ -104,7 +110,7 @@ const defaultPreferences: Preferences = {
   strictMode: true,
   allowRecoveryFlexibility: true,
   notes:
-    "Force the correct answer in standard situations. Allow flexibility only in scramble and recovery mode.",
+    "Default philosophy: target first, then adjusted yardage, then shot shape, then club. Use miss-based strategy into greens.",
 };
 
 function clamp(n: number, min: number, max: number) {
@@ -122,331 +128,308 @@ function windAdjustmentYards(distance: number, windDir: string, mph: number) {
   return 0;
 }
 
-function bestClubForDistance(clubs: Club[], target: number, shotType: string) {
-  let best = clubs[0];
+function windLabel(windDir: string, windMph: number) {
+  if (windDir === "calm") return "Calm";
+  if (windDir === "head") return `Headwind ${windMph} mph`;
+  if (windDir === "tail") return `Tailwind ${windMph} mph`;
+  if (windDir === "leftToRight") return `Left-to-right ${windMph} mph`;
+  return `Right-to-left ${windMph} mph`;
+}
+
+function getClubValueForShot(club: Club, shot: ShotType) {
+  if (shot === "punch") {
+    return Math.round(club.stock * 0.65);
+  }
+  if (shot === "draw") return club.draw;
+  if (shot === "fade") return club.fade;
+  if (shot === "knockdownFade") return club.knockdownFade;
+  return club.stock;
+}
+
+function getClubTotal(club: Club, shot: Exclude<ShotType, "punch">) {
+  if (shot === "draw") return club.totalDraw ?? club.totalStock ?? club.draw + 7;
+  if (shot === "fade") return club.totalFade ?? club.totalStock ?? club.fade + 10;
+  return club.totalStock ?? club.stock + 10;
+}
+
+function bestClubForDistance(clubs: Club[], target: number, shotType: ShotType, options?: { punchOnly?: boolean; excludeWoods?: boolean }) {
+  let pool = clubs;
+  if (options?.punchOnly) {
+    pool = clubs.filter((club) => ["5 Iron", "6 Iron", "7 Iron", "8 Iron"].includes(club.club));
+  } else if (options?.excludeWoods) {
+    pool = clubs.filter((club) => !["Driver", "3 Wood", "5 Wood"].includes(club.club));
+  }
+  let best = pool[0];
   let diff = Infinity;
-
-  for (const club of clubs) {
-    const yardage = (club as Record<string, number | string | undefined>)[
-      shotType
-    ] as number | undefined;
-    const chosen = yardage ?? club.stock;
-    const d = Math.abs(chosen - target);
-
+  for (const club of pool) {
+    const selected = getClubValueForShot(club, shotType);
+    const d = Math.abs(selected - target);
     if (d < diff) {
       best = club;
       diff = d;
     }
   }
-
   return best;
 }
 
-function generateScenario(clubs: Club[], preferences: Preferences): Scenario {
-  const template = randomFrom(holeTemplates);
-  const windOptions = [
-    "calm",
-    "head",
-    "tail",
-    "leftToRight",
-    "rightToLeft",
-  ] as const;
-  const windDir = randomFrom(windOptions);
-  const windMph =
-    windDir === "calm" ? 0 : randomFrom([5, 8, 10, 12, 15, 18, 20, 25]);
+function getRiskLineText(kind: string, start: number, width: number, severity: HazardSeverity) {
+  if (kind === "water") return `Water starts at about ${start} carry and becomes a high-penalty miss.`;
+  if (kind === "bunkers") return `Fairway bunkers begin around ${start} and squeeze the landing area to about ${width} yards.`;
+  if (kind === "rough") return `The fairway narrows to about ${width} yards near ${start}, with thick rough waiting on the miss side.`;
+  return `The landing zone pinches down around ${start}, leaving only about ${width} yards of real fairway. Severity: ${severity}.`;
+}
 
-  if (template.type === "tee") {
-    const fairwaySide = randomFrom(["left", "right", "center"] as const);
-    const hazard = randomFrom([
-      "water through the driver landing area",
-      "fairway bunkers at driver distance",
-      "trees squeezing the right side",
-      "thick rough left of the fairway",
-      "no major hazard, but narrow width",
-    ]);
-    const landingMax = randomFrom([230, 240, 250, 260, 270]);
-    const safeWidth = randomFrom([20, 25, 30, 35]);
-    const holeYardage = randomFrom([365, 388, 402, 418, 435, 452]);
-    const par = holeYardage >= 445 ? 5 : 4;
+function buildTeeScenario(clubs: Club[], preferences: Preferences, windDir: string, windMph: number): Scenario {
+  const holeYardage = randomFrom([392, 405, 418, 428, 438, 452]);
+  const par = holeYardage >= 445 ? 5 : 4;
+  const fairwaySide = randomFrom(["left", "right", "center"] as const);
+  const hazardKind = randomFrom(["water", "bunkers", "rough", "pinch"] as const);
+  const severity = randomFrom(["low", "medium", "high"] as const);
+  const hazardStart = randomFrom([258, 264, 270, 276]);
+  const fairwayWidth = randomFrom([18, 22, 26, 30]);
 
-    let recommendation = "";
-    let shot = "fade";
-    let club = clubs.find((c) => c.club === "Driver") || clubs[0];
-    const reasoning: string[] = [];
+  const driver = clubs.find((c) => c.club === "Driver") || clubs[0];
+  const preferredDriverShot: Exclude<ShotType, "knockdownFade" | "punch"> = fairwaySide === "left"
+    ? "fade"
+    : fairwaySide === "right" && preferences.allowDrawOffTee
+    ? "draw"
+    : preferences.preferredTeeShape === "stock"
+    ? "stock"
+    : preferences.preferredTeeShape;
 
-    const driverStock = club.stock;
-    const driverTotalStock = club.totalStock ?? driverStock + 10;
-    const driverTotalDraw = club.totalDraw ?? driverTotalStock + 7;
-    const driverTotalFade = club.totalFade ?? driverTotalStock - 5;
-    const layupClub =
-      clubs.find((c) => c.stock <= landingMax - 10) || clubs[clubs.length - 1];
-    const cross = windDir === "leftToRight" || windDir === "rightToLeft";
-    const strongWind = windMph >= 15;
+  const driverCarry = getClubValueForShot(driver, preferredDriverShot);
+  const driverTotal = getClubTotal(driver, preferredDriverShot === "stock" ? "stock" : preferredDriverShot);
+  const layupClub = bestClubForDistance(clubs.filter((c) => !["Driver"].includes(c.club)), hazardStart - 18, preferences.preferredLayupShape);
+  const layupCarry = getClubValueForShot(layupClub, preferences.preferredLayupShape);
+  const remainingIfDriver = holeYardage - driverTotal;
+  const remainingIfLayup = holeYardage - layupCarry;
 
-    const rolloutRisk = driverTotalStock > landingMax + 5;
-    const carryRisk = landingMax < driverStock - 5;
-    const narrowWindRisk = safeWidth <= 25 && strongWind;
-    const troubleRisk = hazard.includes("water") || hazard.includes("bunkers");
+  const severePenalty = severity === "high" || hazardKind === "water";
+  const crosswindPenalty = (windDir === "leftToRight" || windDir === "rightToLeft") && windMph >= 12 && fairwayWidth <= 22;
+  const actualRunThroughRisk = driverTotal >= hazardStart - 2;
+  const actualCarryIntoRisk = driverCarry >= hazardStart && severePenalty;
+  const leaveTooLong = remainingIfLayup > 195;
+  const driverStillPlayable = !actualCarryIntoRisk && !(crosswindPenalty && severePenalty);
 
-    const remainingIfDriver = holeYardage - driverTotalStock;
-    const remainingIfLayup = holeYardage - layupClub.stock;
-    const layupCreatesTooLongApproach = remainingIfLayup > 200;
-    const driverMeaningfullyImprovesScoring = remainingIfDriver < 190;
+  let correctClub = driver.club;
+  let correctShot: ShotType = preferredDriverShot;
+  let targetLabel = fairwaySide === "left" ? "Left-center fairway shelf" : fairwaySide === "right" ? "Right-center fairway shelf" : "Center fairway landing window";
+  let whyRisky = getRiskLineText(hazardKind, hazardStart, fairwayWidth, severity);
+  const reasoning: string[] = [];
 
-    const shouldFavorAggression =
-      layupCreatesTooLongApproach &&
-      driverMeaningfullyImprovesScoring &&
-      !rolloutRisk &&
-      !carryRisk &&
-      !narrowWindRisk &&
-      !hazard.includes("water");
-
-    const shouldLayUp =
-      (troubleRisk || carryRisk || narrowWindRisk || rolloutRisk) &&
-      !shouldFavorAggression;
-
-    if (shouldLayUp) {
-      shot = preferences.preferredLayupShape;
-      club = layupClub;
-      recommendation = `Lay up with ${club.club}`;
-      reasoning.push(
-        "Driver brings unnecessary risk into the landing area based on carry and rollout."
-      );
-      reasoning.push(
-        "A shorter club keeps the ball in the widest usable section of the fairway."
-      );
-    } else {
-      if (shouldFavorAggression) {
-        shot = preferences.preferredTeeShape;
-        recommendation = `Hit a ${shot} with ${club.club}`;
-        reasoning.push(
-          "Laying back leaves too long of an approach for this hole length."
-        );
-        reasoning.push(
-          "A controlled aggressive tee shot improves the scoring position."
-        );
-      } else if (fairwaySide === "left") {
-        shot = "fade";
-        recommendation = `Hit a ${shot} with ${club.club}`;
-        reasoning.push(
-          "The fairway sits left, so a controlled cut matches the hole shape and opens the landing zone."
-        );
-      } else if (fairwaySide === "right") {
-        shot = preferences.allowDrawOffTee ? "draw" : "fade";
-        recommendation = `Hit a ${shot} with ${club.club}`;
-        reasoning.push(
-          shot === "draw"
-            ? "The fairway favors a draw and you allow that pattern off the tee."
-            : "Even though the fairway favors the right side, your safer pattern is still the preferred play."
-        );
-      } else {
-        shot = preferences.preferredTeeShape;
-        recommendation = `Hit a ${shot} with ${club.club}`;
-        reasoning.push("With a neutral fairway, use the most reliable tee pattern.");
-      }
-
-      if (cross) {
-        const windText =
-          windDir === "leftToRight" ? "left-to-right" : "right-to-left";
-        reasoning.push(
-          `The ${windText} wind should influence your start line and curve management.`
-        );
-      }
-    }
-
-    return {
-      mode: "strict",
-      category: "Tee Shot",
-      title: template.title,
-      prompt: `Hole: Par ${par}, ${holeYardage} yards. You are on the tee. Fairway position: ${fairwaySide}. Wind: ${windDir} ${
-        windMph ? `at ${windMph} mph` : ""
-      }. Hazard note: ${hazard}. Driver carry ~${driverStock} and total ~${driverTotalStock} (draw ~${driverTotalDraw}, fade ~${driverTotalFade}). Driver landing area begins to get risky around ${landingMax} yards. Fairway width is about ${safeWidth} yards. What is the best play?`,
-      recommendation,
-      correctClub: club.club,
-      correctShot: shot,
-      explanation: reasoning.join(" "),
-      windDir,
-      windMph,
-      holeYardage,
-      par,
-      targetYardage: null,
-      distanceContext: `Par ${par} • ${holeYardage} yards`,
-    };
+  if ((actualRunThroughRisk || actualCarryIntoRisk || crosswindPenalty) && (!leaveTooLong || !driverStillPlayable)) {
+    correctClub = layupClub.club;
+    correctShot = preferences.preferredLayupShape;
+    targetLabel = "Safe fairway section short of the hazard line";
+    reasoning.push("The primary goal is staying short of the actual trouble line with a full fairway target.");
+    reasoning.push("This is one of the few cases where the penalty for using driver is real enough to justify sacrificing distance.");
+  } else {
+    reasoning.push("The target should be chosen first, then the yardage window, then the shot, then the club.");
+    reasoning.push("Even though there is some risk, laying too far back would create a worse scoring position on the next shot.");
   }
 
-  if (template.type === "approach") {
-    const base = randomFrom([118, 126, 134, 142, 151, 158, 166, 174, 182]);
-    const holeYardage = randomFrom([365, 388, 402, 418, 435]);
-    const par = 4;
-    const adjusted = clamp(
-      base + windAdjustmentYards(base, windDir, windMph),
-      75,
-      220
-    );
-    const club = bestClubForDistance(
-      clubs,
-      adjusted,
-      preferences.preferredApproachShape
-    );
-    const miss = randomFrom([
-      "long is dead",
-      "short is okay",
-      "right bunker",
-      "left water",
-      "tight front pin",
-    ]);
-    const greenFirmness = randomFrom(["soft", "average", "firm"]);
-
-    const windNotes: string[] = [];
-    if (windDir === "head") {
-      windNotes.push(
-        "Headwind adds effective distance and makes high-spin shots less predictable."
-      );
-    }
-    if (windDir === "tail") {
-      windNotes.push(
-        "Tailwind reduces effective yardage but can make stopping power harder to judge."
-      );
-    }
-    if (windDir === "leftToRight") {
-      windNotes.push(
-        "Left-to-right wind asks for a start line that resists drift."
-      );
-    }
-    if (windDir === "rightToLeft") {
-      windNotes.push(
-        "Right-to-left wind asks for a start line that resists over-curving."
-      );
-    }
-
-    return {
-      mode: "strict",
-      category: "Approach Shot",
-      title: template.title,
-      prompt: `Hole: Par ${par}, ${holeYardage} yards. You have ${base} yards to the pin. Wind: ${windDir} ${
-        windMph ? `at ${windMph} mph` : ""
-      }. Green firmness: ${greenFirmness}. Trouble: ${miss}. Your preferred approach pattern is a controlled knockdown fade. What is the best play?`,
-      recommendation: `Hit a ${preferences.preferredApproachShape} with ${club.club}`,
-      correctClub: club.club,
-      correctShot: preferences.preferredApproachShape,
-      explanation: `Adjusted playing yardage is about ${adjusted} yards. ${windNotes.join(
-        " "
-      )} A flatter, controlled flight improves distance control and reduces curve volatility into the green.`,
-      windDir,
-      windMph,
-      holeYardage,
-      par,
-      targetYardage: base,
-      distanceContext: `Par ${par} • ${holeYardage} yards`,
-    };
-  }
-
-  if (template.type === "recovery") {
-    const recoveryType = randomFrom([
-      "missed fairway",
-      "blocked by trees",
-      "punch-out angle",
-      "bad lie in rough",
-    ]);
-    const remaining = randomFrom([135, 148, 162, 176, 188, 205]);
-    const lie = randomFrom([
-      "sitting down in rough",
-      "clean but blocked",
-      "bare lie",
-      "under tree limbs",
-    ]);
-    const opening = randomFrom([
-      "small gap only",
-      "half-swing window",
-      "full escape to fairway",
-      "low punch lane",
-    ]);
-    const safeLeave = randomFrom([85, 95, 105, 115]);
-    const holeYardage = randomFrom([395, 410, 428, 446, 472]);
-    const par = holeYardage >= 445 ? 5 : 4;
-    const shotChoices = [
-      { label: "Punch back to fairway", shot: "punch", yardage: safeLeave },
-      { label: "Low punch fade", shot: "punch", yardage: safeLeave + 10 },
-      { label: "Advance safely", shot: "stock", yardage: safeLeave + 20 },
-    ];
-    const chosen = randomFrom(shotChoices);
-    const targetAdvance = Math.max(remaining - chosen.yardage, 20);
-    const lookupShot = chosen.shot === "punch" ? "stock" : chosen.shot;
-    const club = bestClubForDistance(clubs, targetAdvance, lookupShot);
-
-    return {
-      mode: "recovery",
-      category: "Scramble / Recovery",
-      title: template.title,
-      prompt: `Hole: Par ${par}, ${holeYardage} yards. Recovery situation: ${recoveryType}. You have ${remaining} yards left. Lie: ${lie}. Escape window: ${opening}. A smart recovery should leave about ${chosen.yardage} yards for the next shot, not force the green. What is the best play?`,
-      recommendation: `${chosen.label} with ${club.club}`,
-      correctClub: club.club,
-      correctShot: chosen.shot,
-      explanation:
-        "Recovery mode allows flexibility, but only within disciplined boundaries. The goal is to recover to a scoring position, not attempt a hero shot from a compromised position.",
-      windDir,
-      windMph,
-      holeYardage,
-      par,
-      targetYardage: remaining,
-      distanceContext: `Recovery • Par ${par} • ${holeYardage} yards`,
-    };
-  }
-
-  const layupTarget = randomFrom([75, 85, 90, 100, 110, 120]);
-  const startDistance = randomFrom([235, 245, 255, 265, 275]);
-  const holeYardage = randomFrom([495, 515, 530, 548, 565]);
-  const par = 5;
-  const effective = startDistance + windAdjustmentYards(startDistance, windDir, windMph);
-  const club = bestClubForDistance(
-    clubs,
-    effective - layupTarget,
-    preferences.preferredLayupShape
-  );
+  const prompt = `Hole: Par ${par}, ${holeYardage} yards. Target: ${targetLabel}. Wind: ${windLabel(windDir, windMph)}. Fairway favors the ${fairwaySide}. Risk line: ${whyRisky} Driver ${preferredDriverShot} carries about ${driverCarry} and finishes around ${driverTotal}. A ${layupClub.club} ${preferences.preferredLayupShape} carries about ${layupCarry}. What is the best play?`;
 
   return {
     mode: "strict",
-    category: "Layup Decision",
-    title: template.title,
-    prompt: `Hole: Par ${par}, ${holeYardage} yards. You are ${startDistance} yards from the hole on a par 5. Wind: ${windDir} ${
-      windMph ? `at ${windMph} mph` : ""
-    }. The green is not worth forcing. Your favorite wedge number is ${layupTarget} yards. What is the best play?`,
-    recommendation: `Lay up with ${club.club} to leave about ${layupTarget} yards`,
-    correctClub: club.club,
-    correctShot: preferences.preferredLayupShape,
-    explanation:
-      "This is a position play. Instead of chasing maximum distance, choose the club that leaves your favorite scoring yardage. Effective remaining distance is influenced by the wind, so discipline matters more than aggression here.",
+    type: "tee",
+    category: "Tee Shot",
+    title: "Tee Shot Decision",
+    prompt,
+    targetLabel,
+    adjustedYardageLabel: correctClub === driver.club ? `Landing window starts around ${hazardStart}` : `Stay short of ${hazardStart}`,
+    recommendation: `${correctShot === preferences.preferredLayupShape && correctClub !== driver.club ? "Play" : "Hit"} a ${correctShot} with ${correctClub}`,
+    correctClub,
+    correctShot,
+    explanation: reasoning.join(" "),
+    whyRisky,
     windDir,
     windMph,
     holeYardage,
     par,
-    targetYardage: startDistance,
+    targetYardage: correctClub === driver.club ? driverCarry : layupCarry,
     distanceContext: `Par ${par} • ${holeYardage} yards`,
   };
 }
 
-function runSanityChecks() {
-  const results = Array.from({ length: 12 }, () =>
-    generateScenario(defaultClubs, defaultPreferences)
-  );
+function buildApproachScenario(clubs: Club[], preferences: Preferences, windDir: string, windMph: number): Scenario {
+  const base = randomFrom([118, 126, 134, 142, 151, 158, 166, 174, 182]);
+  const holeYardage = randomFrom([360, 372, 388, 401, 417]);
+  const par = 4;
+  const pinLocation = randomFrom(["front", "middle", "back"] as const);
+  const greenFirmness = randomFrom(["soft", "average", "firm"] as const);
+  const danger = randomFrom(["water short", "left bunker", "long is dead", "short false front", "back rough"] as const);
+  let targetLabel = "Middle of green";
+  let targetAdjustment = 0;
 
+  if (danger === "water short" || danger === "short false front") {
+    targetLabel = pinLocation === "front" ? "Front-middle safety number" : "Middle of green";
+    targetAdjustment = 4;
+  } else if (danger === "long is dead") {
+    targetLabel = pinLocation === "back" ? "Middle number, stay under the hole" : "Middle of green";
+    targetAdjustment = -4;
+  } else if (pinLocation === "back") {
+    targetLabel = "Back-middle number";
+    targetAdjustment = 3;
+  } else if (pinLocation === "front") {
+    targetLabel = "Front-middle number";
+    targetAdjustment = -2;
+  }
+
+  if (greenFirmness === "firm") targetAdjustment -= 2;
+  if (greenFirmness === "soft") targetAdjustment += 1;
+
+  const adjusted = clamp(base + targetAdjustment + windAdjustmentYards(base, windDir, windMph), 70, 210);
+  const shot = preferences.preferredApproachShape as ShotType;
+  const correctClub = bestClubForDistance(clubs, adjusted, shot, { excludeWoods: true });
+  const prompt = `Hole: Par ${par}, ${holeYardage} yards. Target: ${targetLabel}. Raw carry to the flag is ${base}. Wind: ${windLabel(windDir, windMph)}. Pin: ${pinLocation}. Green firmness: ${greenFirmness}. Main danger: ${danger}. Using miss-based strategy, what is the best play?`;
+
+  return {
+    mode: "strict",
+    type: "approach",
+    category: "Approach Shot",
+    title: "Approach Decision",
+    prompt,
+    targetLabel,
+    adjustedYardageLabel: `Adjusted target about ${adjusted}`,
+    recommendation: `Hit a ${shot} with ${correctClub.club}`,
+    correctClub: correctClub.club,
+    correctShot: shot,
+    explanation: `The decision starts with the safest scoring target, not the flag by itself. Once the target is chosen, the yardage is adjusted for wind, firmness, and danger. Then the shot shape is chosen, and then the club.`,
+    windDir,
+    windMph,
+    holeYardage,
+    par,
+    targetYardage: adjusted,
+    distanceContext: `Par ${par} • ${holeYardage} yards`,
+  };
+}
+
+function buildClubSelectionScenario(clubs: Club[], preferences: Preferences, windDir: string, windMph: number): Scenario {
+  const carryNumber = randomFrom([92, 101, 109, 117, 126, 134, 143, 151, 159, 168, 176]);
+  const holeYardage = randomFrom([364, 378, 392, 408, 426]);
+  const par = 4;
+  const pinLocation = randomFrom(["front", "middle", "back"] as const);
+  const greenFirmness = randomFrom(["soft", "average", "firm"] as const);
+  const danger = randomFrom(["short bunker", "water short", "long is dead", "back rough", "front false edge"] as const);
+  let targetLabel = "Center-green scoring number";
+  let targetAdjustment = 0;
+
+  if (danger === "water short" || danger === "front false edge") targetAdjustment += 4;
+  if (danger === "long is dead") targetAdjustment -= 4;
+  if (pinLocation === "back") targetAdjustment += 2;
+  if (pinLocation === "front") targetAdjustment -= 2;
+  if (greenFirmness === "firm") targetAdjustment -= 2;
+
+  const adjusted = clamp(carryNumber + targetAdjustment + windAdjustmentYards(carryNumber, windDir, windMph), 65, 205);
+  const shot = preferences.preferredApproachShape as ShotType;
+  const club = bestClubForDistance(clubs, adjusted, shot, { excludeWoods: true });
+
+  return {
+    mode: "strict",
+    type: "clubSelection",
+    category: "Club Selection Trainer",
+    title: "Club Selection Trainer",
+    prompt: `Hole: Par ${par}, ${holeYardage} yards. Target: ${targetLabel}. Carry to the original number is ${carryNumber}. Wind: ${windLabel(windDir, windMph)}. Pin: ${pinLocation}. Green firmness: ${greenFirmness}. Main danger: ${danger}. What is the best play?`,
+    targetLabel,
+    adjustedYardageLabel: `Adjusted target about ${adjusted}`,
+    recommendation: `Hit a ${shot} with ${club.club}`,
+    correctClub: club.club,
+    correctShot: shot,
+    explanation: `This mode is built specifically to punish short and long club mistakes. The correct answer comes from target first, adjusted yardage second, shot third, and club last.`,
+    windDir,
+    windMph,
+    holeYardage,
+    par,
+    targetYardage: adjusted,
+    distanceContext: `Club Choice • Par ${par} • ${holeYardage} yards`,
+  };
+}
+
+function buildRecoveryScenario(clubs: Club[], windDir: string, windMph: number): Scenario {
+  const holeYardage = randomFrom([398, 412, 428, 446]);
+  const par = holeYardage >= 445 ? 5 : 4;
+  const remaining = randomFrom([148, 162, 176, 188, 202]);
+  const lie = randomFrom(["under tree limbs", "clean but blocked", "rough with no full release"] as const);
+  const opening = randomFrom(["low punch lane", "small window back to fairway", "half-window to safe angle"] as const);
+  const safeLeave = randomFrom([80, 90, 100, 110]);
+  const targetAdvance = Math.max(remaining - safeLeave, 45);
+  const correctShot: ShotType = "punch";
+  const correctClub = bestClubForDistance(clubs, targetAdvance, "punch", { punchOnly: true });
+  const targetLabel = `Advance the ball low to leave about ${safeLeave}`;
+
+  return {
+    mode: "recovery",
+    type: "recovery",
+    category: "Scramble / Recovery",
+    title: "Recovery Decision",
+    prompt: `Hole: Par ${par}, ${holeYardage} yards. Target: ${targetLabel}. You have ${remaining} left. Lie: ${lie}. Escape window: ${opening}. Wind: ${windLabel(windDir, windMph)}. What is the best play?`,
+    targetLabel,
+    adjustedYardageLabel: `Advance about ${targetAdvance}`,
+    recommendation: `Play a punch with ${correctClub.club}`,
+    correctClub: correctClub.club,
+    correctShot,
+    explanation: `Recovery mode allows flexibility, but only within disciplined boundaries. A punch shot should use a lower-lofted club that launches low and advances predictably.`,
+    windDir,
+    windMph,
+    holeYardage,
+    par,
+    targetYardage: targetAdvance,
+    distanceContext: `Recovery • Par ${par} • ${holeYardage} yards`,
+  };
+}
+
+function buildLayupScenario(clubs: Club[], preferences: Preferences, windDir: string, windMph: number): Scenario {
+  const holeYardage = randomFrom([500, 518, 532, 548, 562]);
+  const par = 5;
+  const favoriteWedge = randomFrom([80, 90, 100, 110]);
+  const distanceLeft = randomFrom([228, 242, 256, 268]);
+  const effective = distanceLeft + windAdjustmentYards(distanceLeft, windDir, windMph);
+  const targetAdvance = Math.max(effective - favoriteWedge, 60);
+  const shot = preferences.preferredLayupShape as ShotType;
+  const club = bestClubForDistance(clubs, targetAdvance, shot);
+
+  return {
+    mode: "strict",
+    type: "layup",
+    category: "Layup Decision",
+    title: "Par-5 Position Play",
+    prompt: `Hole: Par ${par}, ${holeYardage} yards. Target: favorite wedge number of ${favoriteWedge}. You have ${distanceLeft} left. Wind: ${windLabel(windDir, windMph)}. The green is not worth forcing. What is the best play?`,
+    targetLabel: `Leave ${favoriteWedge} yards`,
+    adjustedYardageLabel: `Advance about ${targetAdvance}`,
+    recommendation: `Hit a ${shot} with ${club.club}`,
+    correctClub: club.club,
+    correctShot: shot,
+    explanation: `This is a target-first layup. The objective is not maximum distance. The objective is the preferred wedge number.`,
+    windDir,
+    windMph,
+    holeYardage,
+    par,
+    targetYardage: targetAdvance,
+    distanceContext: `Par ${par} • ${holeYardage} yards`,
+  };
+}
+
+function generateScenario(clubs: Club[], preferences: Preferences): Scenario {
+  const windOptions = ["calm", "head", "tail", "leftToRight", "rightToLeft"] as const;
+  const windDir = randomFrom(windOptions);
+  const windMph = windDir === "calm" ? 0 : randomFrom([5, 8, 10, 12, 15, 18, 20]);
+  const type = randomFrom(["tee", "approach", "layup", "recovery", "clubSelection"] as const);
+
+  if (type === "tee") return buildTeeScenario(clubs, preferences, windDir, windMph);
+  if (type === "approach") return buildApproachScenario(clubs, preferences, windDir, windMph);
+  if (type === "layup") return buildLayupScenario(clubs, preferences, windDir, windMph);
+  if (type === "clubSelection") return buildClubSelectionScenario(clubs, preferences, windDir, windMph);
+  return buildRecoveryScenario(clubs, windDir, windMph);
+}
+
+function runSanityChecks() {
+  const results = Array.from({ length: 12 }, () => generateScenario(defaultClubs, defaultPreferences));
   return [
-    {
-      name: "Generates 12 scenarios without crashing",
-      pass: results.length === 12,
-    },
-    {
-      name: "Every scenario has a recommendation",
-      pass: results.every((s) => s.recommendation.length > 0),
-    },
-    {
-      name: "Every scenario has a correct club and shot",
-      pass: results.every((s) => !!s.correctClub && !!s.correctShot),
-    },
-    {
-      name: "Every scenario includes hole yardage context",
-      pass: results.every((s) => s.distanceContext.includes("Par")),
-    },
+    { name: "Generates scenarios without crashing", pass: results.length === 12 },
+    { name: "Every scenario has a target label", pass: results.every((s) => !!s.targetLabel) },
+    { name: "Every scenario has a recommendation", pass: results.every((s) => !!s.recommendation) },
+    { name: "Recovery uses punch only", pass: results.filter((s) => s.type === "recovery").every((s) => s.correctShot === "punch") },
   ];
 }
 
@@ -454,7 +437,6 @@ const sanityChecks = runSanityChecks();
 
 function loadLocal<T>(key: string, fallback: T): T {
   if (typeof window === "undefined") return fallback;
-
   try {
     const saved = window.localStorage.getItem(key);
     return saved ? (JSON.parse(saved) as T) : fallback;
@@ -464,44 +446,25 @@ function loadLocal<T>(key: string, fallback: T): T {
 }
 
 export default function GolfCourseManagementQuizApp() {
-  const [clubs, setClubs] = useState<Club[]>(() =>
-    loadLocal("golf-app-clubs", defaultClubs)
-  );
-  const [preferences, setPreferences] = useState<Preferences>(() =>
-    loadLocal("golf-app-preferences", defaultPreferences)
-  );
-  const [scenario, setScenario] = useState<Scenario>(() =>
-    generateScenario(defaultClubs, defaultPreferences)
-  );
+  const [clubs, setClubs] = useState<Club[]>(() => loadLocal("golf-app-clubs", defaultClubs));
+  const [preferences, setPreferences] = useState<Preferences>(() => loadLocal("golf-app-preferences", defaultPreferences));
+  const [scenario, setScenario] = useState<Scenario>(() => generateScenario(defaultClubs, defaultPreferences));
+  const [answerShot, setAnswerShot] = useState<ShotType | "">("");
   const [answerClub, setAnswerClub] = useState("");
-  const [answerShot, setAnswerShot] = useState("");
-  const [feedback, setFeedback] = useState<{
-    clubCorrect: boolean;
-    shotCorrect: boolean;
-    isCorrect: boolean;
-  } | null>(null);
-  const [score, setScore] = useState<{ correct: number; total: number }>(() =>
-    loadLocal("golf-app-score", { correct: 0, total: 0 })
-  );
+  const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const [score, setScore] = useState<{ correct: number; total: number }>(() => loadLocal("golf-app-score", { correct: 0, total: 0 }));
   const [tab, setTab] = useState("quiz");
 
   const clubNames = useMemo(() => clubs.map((c) => c.club), [clubs]);
   const pct = score.total ? Math.round((score.correct / score.total) * 100) : 0;
 
   useEffect(() => {
-    window.localStorage.setItem("golf-app-clubs", JSON.stringify(clubs));
-  }, [clubs]);
-
-  useEffect(() => {
-    window.localStorage.setItem(
-      "golf-app-preferences",
-      JSON.stringify(preferences)
-    );
-  }, [preferences]);
-
-  useEffect(() => {
-    window.localStorage.setItem("golf-app-score", JSON.stringify(score));
-  }, [score]);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("golf-app-clubs", JSON.stringify(clubs));
+      window.localStorage.setItem("golf-app-preferences", JSON.stringify(preferences));
+      window.localStorage.setItem("golf-app-score", JSON.stringify(score));
+    }
+  }, [clubs, preferences, score]);
 
   function updateClub(index: number, field: keyof Club, value: string) {
     setClubs((prev) => {
@@ -515,16 +478,7 @@ export default function GolfCourseManagementQuizApp() {
   }
 
   function addClub() {
-    setClubs((prev) => [
-      ...prev,
-      {
-        club: `New Club ${prev.length + 1}`,
-        stock: 0,
-        draw: 0,
-        fade: 0,
-        knockdownFade: 0,
-      },
-    ]);
+    setClubs((prev) => [...prev, { club: `New Club ${prev.length + 1}`, stock: 0, draw: 0, fade: 0, knockdownFade: 0 }]);
   }
 
   function removeClub(index: number) {
@@ -533,8 +487,8 @@ export default function GolfCourseManagementQuizApp() {
 
   function newScenario() {
     setScenario(generateScenario(clubs, preferences));
-    setAnswerClub("");
     setAnswerShot("");
+    setAnswerClub("");
     setFeedback(null);
   }
 
@@ -542,29 +496,52 @@ export default function GolfCourseManagementQuizApp() {
     const clubCorrect = answerClub === scenario.correctClub;
     const shotCorrect = answerShot === scenario.correctShot;
     const isCorrect = clubCorrect && shotCorrect;
+    setScore((prev) => ({ correct: prev.correct + (isCorrect ? 1 : 0), total: prev.total + 1 }));
 
-    setScore((prev) => ({
-      correct: prev.correct + (isCorrect ? 1 : 0),
-      total: prev.total + 1,
-    }));
+    const selectedClub = clubs.find((c) => c.club === answerClub);
+    let missLabel = "";
+    let wrongReason = "";
 
-    setFeedback({ clubCorrect, shotCorrect, isCorrect });
+    if (!isCorrect && selectedClub) {
+      const selectedYards = answerShot ? getClubValueForShot(selectedClub, answerShot) : selectedClub.stock;
+      const target = scenario.targetYardage ?? selectedYards;
+      const delta = selectedYards - target;
+
+      if (scenario.type === "clubSelection" || scenario.type === "approach") {
+        if (delta <= -8) {
+          missLabel = "Too Short";
+          wrongReason = "This choice likely leaves the ball short of the scoring target after wind and danger are accounted for.";
+        } else if (delta >= 8) {
+          missLabel = "Too Long";
+          wrongReason = "This choice likely brings long trouble or leaves a worse result than the target-first plan.";
+        } else if (!shotCorrect) {
+          missLabel = "Wrong Shot Shape";
+          wrongReason = "The yardage may be close, but the selected shot shape does not fit the target and miss pattern.";
+        } else {
+          missLabel = "Wrong Club";
+          wrongReason = "The selected club does not fit the adjusted target as well as the recommended club.";
+        }
+      } else if (scenario.type === "recovery") {
+        missLabel = "Poor Recovery Club";
+        wrongReason = "A punch should come from a lower-lofted iron that launches low and advances predictably. High-loft clubs are not correct here.";
+      } else if (!clubCorrect) {
+        missLabel = "Wrong Club";
+        wrongReason = "The selected club does not fit the target-first plan as well as the recommended club.";
+      } else if (!shotCorrect) {
+        missLabel = "Wrong Shot Shape";
+        wrongReason = "The selected shot shape does not match the safest or highest-percentage decision.";
+      }
+    }
+
+    setFeedback({ clubCorrect, shotCorrect, isCorrect, missLabel, wrongReason });
   }
 
   return (
-    <div
-      style={{
-        minHeight: "100vh",
-        background: "#f3f5f7",
-        padding: 16,
-        fontFamily: "Arial, sans-serif",
-        color: "#10233f",
-      }}
-    >
+    <div style={{ minHeight: "100vh", background: "#f3f5f7", padding: 16, fontFamily: "Arial, sans-serif", color: "#10233f" }}>
       <style>{`
         * { box-sizing: border-box; }
         .container { max-width: 1280px; margin: 0 auto; }
-        .hero, .panel, .card { background: white; border-radius: 20px; box-shadow: 0 2px 10px rgba(15, 35, 63, 0.08); border: 1px solid #dde5ee; }
+        .hero, .card { background: white; border-radius: 20px; box-shadow: 0 2px 10px rgba(15, 35, 63, 0.08); border: 1px solid #dde5ee; }
         .hero { background: linear-gradient(135deg, #10233f, #344a68); color: white; }
         .grid-top { display: grid; grid-template-columns: 1.3fr 0.7fr; gap: 16px; }
         .grid-main { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 24px; }
@@ -590,9 +567,10 @@ export default function GolfCourseManagementQuizApp() {
         .icon-btn { border: 0; background: #eef3f8; border-radius: 12px; width: 42px; height: 42px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
         .progress-wrap { height: 12px; border-radius: 999px; background: #e2e8f0; overflow: hidden; }
         .progress-bar { height: 100%; background: #10233f; }
+        .pill-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
         ul { margin: 0; padding-left: 20px; }
         @media (max-width: 900px) {
-          .grid-top, .grid-main, .answer-grid, .score-grid, .feedback-grid { grid-template-columns: 1fr; }
+          .grid-top, .grid-main, .answer-grid, .score-grid, .feedback-grid, .pill-grid { grid-template-columns: 1fr; }
           .tab-row { grid-template-columns: 1fr 1fr; }
           .bag-header { display: none; }
           .bag-row { grid-template-columns: 1fr; }
@@ -601,42 +579,15 @@ export default function GolfCourseManagementQuizApp() {
       `}</style>
 
       <div className="container" style={{ display: "grid", gap: 24 }}>
-        <motion.div
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="grid-top"
-        >
+        <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="grid-top">
           <div className="hero" style={{ padding: 24 }}>
-            <div
-              style={{
-                fontSize: 12,
-                color: "#dce7f3",
-                marginBottom: 12,
-                display: "block",
-              }}
-            >
-              Mobile-friendly and ready to save to home screen after deployment.
-            </div>
+            <div style={{ fontSize: 12, color: "#dce7f3", marginBottom: 12 }}>Mobile-friendly and ready to save to home screen after deployment.</div>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 16 }}>
               <div>
-                <div
-                  className="pill"
-                  style={{
-                    background: "rgba(255,255,255,0.15)",
-                    color: "white",
-                    marginBottom: 12,
-                  }}
-                >
-                  Golf IQ Trainer
-                </div>
-                <h1 style={{ margin: 0, fontSize: 36 }}>
-                  Course Management Q&amp;A App
-                </h1>
+                <div className="pill" style={{ background: "rgba(255,255,255,0.15)", color: "white", marginBottom: 12 }}>Golf IQ Trainer</div>
+                <h1 style={{ margin: 0, fontSize: 36 }}>Course Management Q&amp;A App</h1>
                 <p style={{ maxWidth: 760, lineHeight: 1.7, color: "#dce7f3" }}>
-                  Build disciplined decision-making off the tee, in the wind, and
-                  into greens. Customize every club in the bag, then test
-                  course-management choices with randomized scenarios and instant
-                  explanations.
+                  Build disciplined decision-making around the correct order: target, adjusted yardage, shot shape, then club.
                 </p>
               </div>
               <Target size={40} />
@@ -644,54 +595,17 @@ export default function GolfCourseManagementQuizApp() {
           </div>
 
           <div className="card" style={{ padding: 24 }}>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                fontSize: 24,
-                fontWeight: 700,
-                marginBottom: 6,
-              }}
-            >
-              <Trophy size={20} /> Scoreboard
-            </div>
-            <div className="muted" style={{ marginBottom: 16 }}>
-              Strict scoring based on the single highest-percentage decision
-            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 24, fontWeight: 700, marginBottom: 6 }}><Trophy size={20} /> Scoreboard</div>
+            <div className="muted" style={{ marginBottom: 16 }}>Strict scoring based on the highest-percentage target-first decision</div>
             <div className="score-grid">
-              <div className="soft">
-                <div className="muted" style={{ fontSize: 12 }}>
-                  Correct
-                </div>
-                <div style={{ fontSize: 30, fontWeight: 700 }}>{score.correct}</div>
-              </div>
-              <div className="soft">
-                <div className="muted" style={{ fontSize: 12 }}>
-                  Total
-                </div>
-                <div style={{ fontSize: 30, fontWeight: 700 }}>{score.total}</div>
-              </div>
+              <div className="soft"><div className="muted" style={{ fontSize: 12 }}>Correct</div><div style={{ fontSize: 30, fontWeight: 700 }}>{score.correct}</div></div>
+              <div className="soft"><div className="muted" style={{ fontSize: 12 }}>Total</div><div style={{ fontSize: 30, fontWeight: 700 }}>{score.total}</div></div>
             </div>
             <div style={{ marginTop: 14 }}>
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  marginBottom: 8,
-                }}
-              >
-                <span>Accuracy</span>
-                <strong>{pct}%</strong>
-              </div>
-              <div className="progress-wrap">
-                <div className="progress-bar" style={{ width: `${pct}%` }} />
-              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}><span>Accuracy</span><strong>{pct}%</strong></div>
+              <div className="progress-wrap"><div className="progress-bar" style={{ width: `${pct}%` }} /></div>
             </div>
-            <div className="soft" style={{ marginTop: 16 }}>
-              The goal is repeating the single highest-percentage decision under
-              pressure, even when a more tempting shot exists.
-            </div>
+            <div className="soft" style={{ marginTop: 16 }}>The app now starts with target and adjusted number first, so the logic matches real tournament golf more closely.</div>
           </div>
         </motion.div>
 
@@ -702,13 +616,7 @@ export default function GolfCourseManagementQuizApp() {
             ["philosophy", "Strategy Rules"],
             ["recovery", "Recovery Mode"],
           ].map(([value, label]) => (
-            <button
-              key={value}
-              className={`tab-btn ${tab === value ? "active" : ""}`}
-              onClick={() => setTab(value)}
-            >
-              {label}
-            </button>
+            <button key={value} className={`tab-btn ${tab === value ? "active" : ""}`} onClick={() => setTab(value)}>{label}</button>
           ))}
         </div>
 
@@ -716,70 +624,28 @@ export default function GolfCourseManagementQuizApp() {
           <div className="grid-main">
             <div className="stack">
               <div className="card" style={{ padding: 24 }}>
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    gap: 12,
-                    alignItems: "center",
-                  }}
-                >
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
                   <div>
-                    <div style={{ fontSize: 20, fontWeight: 700 }}>{scenario.title}</div>
+                    <div style={{ fontSize: 32 / 1.6, fontWeight: 700 }}>{scenario.title}</div>
                     <div className="muted">{scenario.category}</div>
                   </div>
                   <div className="badge">{scenario.distanceContext}</div>
                 </div>
-                <p style={{ lineHeight: 1.7, marginTop: 20 }}>{scenario.prompt}</p>
+                <div className="pill-grid" style={{ marginTop: 18 }}>
+                  <div className="soft"><div className="muted" style={{ marginBottom: 6, display: "flex", alignItems: "center", gap: 8 }}><Map size={16} /> Target</div><strong>{scenario.targetLabel}</strong></div>
+                  <div className="soft"><div className="muted" style={{ marginBottom: 6, display: "flex", alignItems: "center", gap: 8 }}><Ruler size={16} /> Adjusted Yardage</div><strong>{scenario.adjustedYardageLabel}</strong></div>
+                </div>
+                <p style={{ lineHeight: 1.7, marginTop: 18 }}>{scenario.prompt}</p>
+                {scenario.whyRisky ? <div className="soft" style={{ marginTop: 12 }}><strong>Why the landing zone is risky:</strong> {scenario.whyRisky}</div> : null}
               </div>
 
               <div className="card" style={{ padding: 24 }}>
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    fontSize: 24,
-                    fontWeight: 700,
-                    marginBottom: 6,
-                  }}
-                >
-                  <Brain size={20} /> Your Answer
-                </div>
-                <div className="muted" style={{ marginBottom: 18 }}>
-                  Choose the club and shot pattern that best fits the situation
-                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 24, fontWeight: 700, marginBottom: 6 }}><Brain size={20} /> Your Answer</div>
+                <div className="muted" style={{ marginBottom: 18 }}>Answer in the same order the app thinks: target, yardage, shot, then club.</div>
                 <div className="answer-grid">
                   <div>
-                    <label
-                      style={{ display: "block", fontWeight: 700, marginBottom: 8 }}
-                    >
-                      Club
-                    </label>
-                    <select
-                      className="field"
-                      value={answerClub}
-                      onChange={(e) => setAnswerClub(e.target.value)}
-                    >
-                      <option value="">Select a club</option>
-                      {clubNames.map((club) => (
-                        <option key={club} value={club}>
-                          {club}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label
-                      style={{ display: "block", fontWeight: 700, marginBottom: 8 }}
-                    >
-                      Shot Shape
-                    </label>
-                    <select
-                      className="field"
-                      value={answerShot}
-                      onChange={(e) => setAnswerShot(e.target.value)}
-                    >
+                    <label style={{ display: "block", fontWeight: 700, marginBottom: 8 }}>Shot Shape</label>
+                    <select className="field" value={answerShot} onChange={(e) => setAnswerShot(e.target.value as ShotType | "") }>
                       <option value="">Select a shot shape</option>
                       <option value="draw">Draw</option>
                       <option value="fade">Fade</option>
@@ -788,104 +654,56 @@ export default function GolfCourseManagementQuizApp() {
                       <option value="punch">Punch</option>
                     </select>
                   </div>
+                  <div>
+                    <label style={{ display: "block", fontWeight: 700, marginBottom: 8 }}>Club</label>
+                    <select className="field" value={answerClub} onChange={(e) => setAnswerClub(e.target.value)}>
+                      <option value="">Select a club</option>
+                      {clubNames.map((club) => <option key={club} value={club}>{club}</option>)}
+                    </select>
+                  </div>
                 </div>
                 <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginTop: 18 }}>
-                  <button className="btn btn-primary btn-mobile" onClick={submitAnswer}>
-                    Submit Answer
-                  </button>
-                  <button
-                    className="btn btn-secondary btn-mobile"
-                    onClick={newScenario}
-                    style={{ display: "inline-flex", alignItems: "center", gap: 8 }}
-                  >
-                    <RefreshCw size={16} /> New Scenario
-                  </button>
+                  <button className="btn btn-primary btn-mobile" onClick={submitAnswer}>Submit Answer</button>
+                  <button className="btn btn-secondary btn-mobile" onClick={newScenario} style={{ display: "inline-flex", alignItems: "center", gap: 8 }}><RefreshCw size={16} /> New Scenario</button>
                 </div>
               </div>
             </div>
 
             <div className="stack">
               <div className="card" style={{ padding: 24 }}>
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    fontSize: 24,
-                    fontWeight: 700,
-                    marginBottom: 6,
-                  }}
-                >
-                  <Wind size={20} /> Instant Feedback
-                </div>
-                <div className="muted" style={{ marginBottom: 18 }}>
-                  Strictly grade whether the decision matched the intended strategy
-                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 24, fontWeight: 700, marginBottom: 6 }}><Wind size={20} /> Instant Feedback</div>
+                <div className="muted" style={{ marginBottom: 18 }}>Strictly grade whether the decision matched the intended strategy</div>
                 {!feedback ? (
-                  <div className="soft">
-                    Submit an answer to reveal the recommended decision and explanation.
-                  </div>
+                  <div className="soft">Submit an answer to reveal the recommended decision and explanation.</div>
                 ) : (
                   <div className="stack">
                     <div className={`soft ${feedback.isCorrect ? "success" : "warn"}`}>
-                      <div style={{ fontWeight: 700, marginBottom: 8 }}>
-                        {feedback.isCorrect ? "Correct decision" : "Review the decision"}
-                      </div>
+                      <div style={{ fontWeight: 700, marginBottom: 8 }}>{feedback.isCorrect ? "Correct decision" : "Review the decision"}</div>
                       Recommended play: <strong>{scenario.recommendation}</strong>
                     </div>
                     <div className="feedback-grid">
-                      <div className={`soft ${feedback.clubCorrect ? "success" : ""}`}>
-                        <div className="muted">Club</div>
-                        <strong>
-                          {feedback.clubCorrect ? "Correct" : `Best: ${scenario.correctClub}`}
-                        </strong>
-                      </div>
-                      <div className={`soft ${feedback.shotCorrect ? "success" : ""}`}>
-                        <div className="muted">Shot</div>
-                        <strong>
-                          {feedback.shotCorrect ? "Correct" : `Best: ${scenario.correctShot}`}
-                        </strong>
-                      </div>
+                      <div className={`soft ${feedback.shotCorrect ? "success" : ""}`}><div className="muted">Shot</div><strong>{feedback.shotCorrect ? "Correct" : `Best: ${scenario.correctShot}`}</strong></div>
+                      <div className={`soft ${feedback.clubCorrect ? "success" : ""}`}><div className="muted">Club</div><strong>{feedback.clubCorrect ? "Correct" : `Best: ${scenario.correctClub}`}</strong></div>
                     </div>
+                    {!feedback.isCorrect && feedback.missLabel ? (
+                      <div className="soft warn">
+                        <div style={{ fontWeight: 700, marginBottom: 8 }}>Why your answer loses strokes: {feedback.missLabel}</div>
+                        {feedback.wrongReason}
+                      </div>
+                    ) : null}
                     <div className="soft">{scenario.explanation}</div>
                   </div>
                 )}
               </div>
 
               <div className="card" style={{ padding: 24 }}>
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    fontSize: 24,
-                    fontWeight: 700,
-                    marginBottom: 6,
-                  }}
-                >
-                  <ShieldCheck size={20} /> Built-In Decision Logic
-                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 24, fontWeight: 700, marginBottom: 6 }}><ShieldCheck size={20} /> Built-In Decision Logic</div>
                 <div className="stack">
-                  <div className="soft">
-                    1. Match the tee shot shape to the fairway when the landing zone
-                    rewards that pattern.
-                  </div>
-                  <div className="soft">
-                    2. If driver brings hazard into play, default to the smarter layup
-                    club.
-                  </div>
-                  <div className="soft">
-                    3. Into greens, favor the controlled knockdown fade for tighter
-                    dispersion and flatter flight.
-                  </div>
-                  <div className="soft">
-                    4. Stronger wind increases the value of trajectory control and
-                    start-line discipline.
-                  </div>
-                  <div className="soft">
-                    5. The app uses one forced correct answer in normal situations to
-                    train discipline, not debate.
-                  </div>
+                  <div className="soft">1. Choose the target first.</div>
+                  <div className="soft">2. Adjust the yardage for wind, firmness, and danger.</div>
+                  <div className="soft">3. Choose the shot shape that best fits the target and miss pattern.</div>
+                  <div className="soft">4. Choose the club last.</div>
+                  <div className="soft">5. Punch shots use lower-lofted irons, not wedges.</div>
                 </div>
               </div>
             </div>
@@ -894,72 +712,25 @@ export default function GolfCourseManagementQuizApp() {
 
         {tab === "bag" && (
           <div className="card" style={{ padding: 24 }}>
-            <div style={{ fontSize: 24, fontWeight: 700, marginBottom: 6 }}>
-              Customize Club Distances
-            </div>
-            <div className="muted" style={{ marginBottom: 18 }}>
-              Enter carry numbers for stock, draw, fade, and knockdown fade
-            </div>
+            <div style={{ fontSize: 24, fontWeight: 700, marginBottom: 6 }}>Customize Club Distances</div>
+            <div className="muted" style={{ marginBottom: 18 }}>Enter carry numbers for stock, draw, fade, and knockdown fade</div>
             <div className="bag-header" style={{ marginBottom: 12 }}>
-              <div>Club</div>
-              <div>Stock</div>
-              <div>Draw</div>
-              <div>Fade</div>
-              <div>Knockdown Fade</div>
-              <div></div>
+              <div>Club</div><div>Stock</div><div>Draw</div><div>Fade</div><div>Knockdown Fade</div><div></div>
             </div>
             <div className="stack">
               {clubs.map((club, index) => (
                 <div key={`${club.club}-${index}`} className="bag-row soft">
-                  <input
-                    className="field"
-                    value={club.club}
-                    onChange={(e) => updateClub(index, "club", e.target.value)}
-                  />
-                  <input
-                    className="field"
-                    type="number"
-                    value={club.stock}
-                    onChange={(e) => updateClub(index, "stock", e.target.value)}
-                  />
-                  <input
-                    className="field"
-                    type="number"
-                    value={club.draw}
-                    onChange={(e) => updateClub(index, "draw", e.target.value)}
-                  />
-                  <input
-                    className="field"
-                    type="number"
-                    value={club.fade}
-                    onChange={(e) => updateClub(index, "fade", e.target.value)}
-                  />
-                  <input
-                    className="field"
-                    type="number"
-                    value={club.knockdownFade}
-                    onChange={(e) =>
-                      updateClub(index, "knockdownFade", e.target.value)
-                    }
-                  />
-                  <button
-                    className="icon-btn"
-                    onClick={() => removeClub(index)}
-                    aria-label={`Remove ${club.club}`}
-                  >
-                    <Trash2 size={16} />
-                  </button>
+                  <input className="field" value={club.club} onChange={(e) => updateClub(index, "club", e.target.value)} />
+                  <input className="field" type="number" value={club.stock} onChange={(e) => updateClub(index, "stock", e.target.value)} />
+                  <input className="field" type="number" value={club.draw} onChange={(e) => updateClub(index, "draw", e.target.value)} />
+                  <input className="field" type="number" value={club.fade} onChange={(e) => updateClub(index, "fade", e.target.value)} />
+                  <input className="field" type="number" value={club.knockdownFade} onChange={(e) => updateClub(index, "knockdownFade", e.target.value)} />
+                  <button className="icon-btn" onClick={() => removeClub(index)} aria-label={`Remove ${club.club}`}><Trash2 size={16} /></button>
                 </div>
               ))}
             </div>
             <div style={{ marginTop: 16 }}>
-              <button
-                className="btn btn-secondary btn-mobile"
-                onClick={addClub}
-                style={{ display: "inline-flex", alignItems: "center", gap: 8 }}
-              >
-                <Plus size={16} /> Add Club
-              </button>
+              <button className="btn btn-secondary btn-mobile" onClick={addClub} style={{ display: "inline-flex", alignItems: "center", gap: 8 }}><Plus size={16} /> Add Club</button>
             </div>
           </div>
         )}
@@ -967,61 +738,22 @@ export default function GolfCourseManagementQuizApp() {
         {tab === "recovery" && (
           <div className="grid-main">
             <div className="card" style={{ padding: 24 }}>
-              <div style={{ fontSize: 24, fontWeight: 700, marginBottom: 6 }}>
-                Scramble / Recovery Mode
-              </div>
-              <div className="muted" style={{ marginBottom: 18 }}>
-                Flexibility is allowed only after a missed fairway, blocked angle,
-                punch-out, or poor lie
-              </div>
+              <div style={{ fontSize: 24, fontWeight: 700, marginBottom: 6 }}>Scramble / Recovery Mode</div>
+              <div className="muted" style={{ marginBottom: 18 }}>Recovery logic now forces low-trajectory punch clubs and specific recovery targets</div>
               <div className="stack">
-                <p style={{ lineHeight: 1.7, margin: 0 }}>
-                  Recovery golf is different from normal course management. In
-                  standard situations, the app forces one correct answer. In recovery
-                  situations, the app allows disciplined flexibility.
-                </p>
-                <div className="soft">
-                  <div style={{ fontWeight: 700, marginBottom: 8 }}>
-                    Recovery principles
-                  </div>
-                  <ul>
-                    <li>Get the ball back in play first</li>
-                    <li>Avoid hero shots unless the opening is truly realistic</li>
-                    <li>Favor angles and yardages that restore control on the next shot</li>
-                    <li>Use punch-outs, low fades, and safe advances when needed</li>
-                  </ul>
-                </div>
-                <div className="soft">
-                  Recovery mode scenarios include missed fairways, trees, blocked
-                  windows, and bad lies.
-                </div>
+                <div className="soft">Use 5 iron through 8 iron for punch answers. Wedges are intentionally removed from correct punch logic.</div>
+                <div className="soft">Recovery still allows flexibility, but only after the correct recovery target is chosen first.</div>
               </div>
             </div>
 
             <div className="card" style={{ padding: 24 }}>
-              <div style={{ fontSize: 24, fontWeight: 700, marginBottom: 6 }}>
-                Why total hole yardage matters
-              </div>
-              <div className="muted" style={{ marginBottom: 18 }}>
-                Yes — this should be included off the tee
-              </div>
+              <div style={{ fontSize: 24, fontWeight: 700, marginBottom: 6 }}>Why the changes matter</div>
+              <div className="muted" style={{ marginBottom: 18 }}>These updates fix the golf logic issues you pointed out</div>
               <div className="stack">
-                <p style={{ lineHeight: 1.7, margin: 0 }}>
-                  Off the tee, hole yardage matters because club choice is not only
-                  about avoiding danger. It is also about setting up the correct
-                  remaining distance, angle, and scoring opportunity for the next
-                  shot.
-                </p>
-                <p style={{ lineHeight: 1.7, margin: 0 }}>
-                  The app includes total hole yardage and par in the scenario prompt
-                  and distance badge, so each tee-shot decision is made in the
-                  context of the full hole.
-                </p>
-                <div className="soft">
-                  Example: a 410-yard par 4 and a 455-yard par 4 may both have
-                  trouble at 270, but they should not always produce the same
-                  decision.
-                </div>
+                <div className="soft">No more title and wind contradictions.</div>
+                <div className="soft">No more high-lofted wedge punch answers.</div>
+                <div className="soft">No more vague “risky” fairway lines without specifics.</div>
+                <div className="soft">No more automatic layups that create terrible 200-yard approaches unless the danger is truly severe.</div>
               </div>
             </div>
           </div>
@@ -1030,50 +762,20 @@ export default function GolfCourseManagementQuizApp() {
         {tab === "philosophy" && (
           <div className="grid-main">
             <div className="card" style={{ padding: 24 }}>
-              <div style={{ fontSize: 24, fontWeight: 700, marginBottom: 6 }}>
-                Training Preferences
-              </div>
-              <div className="muted" style={{ marginBottom: 18 }}>
-                Set the strict decision patterns the app should reinforce
-              </div>
+              <div style={{ fontSize: 24, fontWeight: 700, marginBottom: 6 }}>Training Preferences</div>
+              <div className="muted" style={{ marginBottom: 18 }}>Default philosophy: miss-based strategy into greens</div>
               <div className="stack">
                 <div>
-                  <label
-                    style={{ display: "block", fontWeight: 700, marginBottom: 8 }}
-                  >
-                    Preferred tee shot pattern
-                  </label>
-                  <select
-                    className="field"
-                    value={preferences.preferredTeeShape}
-                    onChange={(e) =>
-                      setPreferences((p) => ({
-                        ...p,
-                        preferredTeeShape: e.target.value,
-                      }))
-                    }
-                  >
+                  <label style={{ display: "block", fontWeight: 700, marginBottom: 8 }}>Preferred tee shot pattern</label>
+                  <select className="field" value={preferences.preferredTeeShape} onChange={(e) => setPreferences((p) => ({ ...p, preferredTeeShape: e.target.value as Preferences["preferredTeeShape"] }))}>
                     <option value="fade">Fade</option>
                     <option value="draw">Draw</option>
                     <option value="stock">Stock</option>
                   </select>
                 </div>
                 <div>
-                  <label
-                    style={{ display: "block", fontWeight: 700, marginBottom: 8 }}
-                  >
-                    Preferred approach pattern
-                  </label>
-                  <select
-                    className="field"
-                    value={preferences.preferredApproachShape}
-                    onChange={(e) =>
-                      setPreferences((p) => ({
-                        ...p,
-                        preferredApproachShape: e.target.value,
-                      }))
-                    }
-                  >
+                  <label style={{ display: "block", fontWeight: 700, marginBottom: 8 }}>Preferred approach pattern</label>
+                  <select className="field" value={preferences.preferredApproachShape} onChange={(e) => setPreferences((p) => ({ ...p, preferredApproachShape: e.target.value as Preferences["preferredApproachShape"] }))}>
                     <option value="knockdownFade">Knockdown Fade</option>
                     <option value="fade">Fade</option>
                     <option value="stock">Stock</option>
@@ -1081,102 +783,33 @@ export default function GolfCourseManagementQuizApp() {
                   </select>
                 </div>
                 <div>
-                  <label
-                    style={{ display: "block", fontWeight: 700, marginBottom: 8 }}
-                  >
-                    Preferred layup shape
-                  </label>
-                  <select
-                    className="field"
-                    value={preferences.preferredLayupShape}
-                    onChange={(e) =>
-                      setPreferences((p) => ({
-                        ...p,
-                        preferredLayupShape: e.target.value,
-                      }))
-                    }
-                  >
+                  <label style={{ display: "block", fontWeight: 700, marginBottom: 8 }}>Preferred layup shape</label>
+                  <select className="field" value={preferences.preferredLayupShape} onChange={(e) => setPreferences((p) => ({ ...p, preferredLayupShape: e.target.value as Preferences["preferredLayupShape"] }))}>
                     <option value="fade">Fade</option>
                     <option value="stock">Stock</option>
                     <option value="draw">Draw</option>
                   </select>
                 </div>
                 <div>
-                  <label
-                    style={{ display: "block", fontWeight: 700, marginBottom: 8 }}
-                  >
-                    Coaching Notes
-                  </label>
-                  <textarea
-                    value={preferences.notes}
-                    onChange={(e) =>
-                      setPreferences((p) => ({ ...p, notes: e.target.value }))
-                    }
-                  />
+                  <label style={{ display: "block", fontWeight: 700, marginBottom: 8 }}>Coaching Notes</label>
+                  <textarea value={preferences.notes} onChange={(e) => setPreferences((p) => ({ ...p, notes: e.target.value }))} />
                 </div>
-                <button className="btn btn-primary btn-mobile" onClick={newScenario}>
-                  Apply Preferences to New Scenarios
-                </button>
+                <button className="btn btn-primary btn-mobile" onClick={newScenario}>Apply Preferences to New Scenarios</button>
               </div>
             </div>
 
             <div className="card" style={{ padding: 24 }}>
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  fontSize: 24,
-                  fontWeight: 700,
-                  marginBottom: 6,
-                }}
-              >
-                <Flag size={20} /> Suggested Training Theme
-              </div>
-              <div className="muted" style={{ marginBottom: 18 }}>
-                How this app should coach your son
-              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 24, fontWeight: 700, marginBottom: 6 }}><Flag size={20} /> Suggested Training Theme</div>
+              <div className="muted" style={{ marginBottom: 18 }}>How the app now thinks</div>
               <div className="stack">
-                <p style={{ lineHeight: 1.7, margin: 0 }}>
-                  This app should train one central habit:{" "}
-                  <strong>
-                    choose the single highest-percentage shot, not the most
-                    tempting shot.
-                  </strong>
-                </p>
-                <p style={{ lineHeight: 1.7, margin: 0 }}>
-                  Your philosophy is strong. Off the tee, shape the ball to the
-                  hole when it increases margin. But if the driver landing area is
-                  compromised by bunkers, water, rough squeeze, or wind, the app
-                  should reward disciplined layups over forced aggression.
-                </p>
-                <p style={{ lineHeight: 1.7, margin: 0 }}>
-                  Into greens, the app should teach a predictable scoring pattern.
-                  Your controlled knockdown fade is ideal because it reduces
-                  height, curve volatility, and distance-control mistakes,
-                  especially in the wind. In standard scenarios, the app should
-                  force that decision instead of rewarding creative alternatives.
-                </p>
+                <div className="soft">Target first</div>
+                <div className="soft">Adjusted yardage second</div>
+                <div className="soft">Shot shape third</div>
+                <div className="soft">Club last</div>
                 <div className="soft">
-                  <div style={{ fontWeight: 700, marginBottom: 8 }}>
-                    Built-in sanity checks
-                  </div>
+                  <div style={{ fontWeight: 700, marginBottom: 8 }}>Sanity checks</div>
                   <ul>
-                    {sanityChecks.map((check) => (
-                      <li key={check.name}>
-                        {check.name}: {check.pass ? "Pass" : "Fail"}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-                <div className="soft">
-                  <div style={{ fontWeight: 700, marginBottom: 8 }}>
-                    Deployment notes
-                  </div>
-                  <ul>
-                    <li>Deploy on Vercel for fast browser access</li>
-                    <li>Open the deployed site on phone and add it to the home screen</li>
-                    <li>Bag setup, preferences, and score save in the browser automatically</li>
+                    {sanityChecks.map((check) => <li key={check.name}>{check.name}: {check.pass ? "Pass" : "Fail"}</li>)}
                   </ul>
                 </div>
               </div>
