@@ -66,6 +66,7 @@ type Feedback = {
   isCorrect: boolean;
   missLabel?: string;
   wrongReason?: string;
+  penaltyScore?: number;
 };
 
 const defaultClubs: Club[] = [
@@ -196,21 +197,62 @@ function bestClubForDistance(
   return best;
 }
 
-function pickBestClubForYardage(clubs: Club[], yardage: number, preferredShot: ShotType) {
+function pickBestClubForYardage(
+  clubs: Club[],
+  yardage: number,
+  preferredShot: ShotType,
+  options?: {
+    danger?: string;
+    firmness?: string;
+    windDir?: string;
+    windMph?: number;
+    targetBias?: "neutral" | "favorLong" | "favorShort";
+  }
+) {
   let best = clubs[0];
-  let smallestDiff = Infinity;
+  let bestPenalty = Infinity;
 
   for (const club of clubs) {
     const carry = getClubValueForShot(club, preferredShot);
-    const diff = Math.abs(carry - yardage);
+    let penalty = Math.abs(carry - yardage);
 
-    if (diff < smallestDiff) {
-      smallestDiff = diff;
+    if (options?.danger === "water short" || options?.danger === "short bunker" || options?.danger === "front false edge") {
+      if (carry < yardage) penalty += 18;
+      if (carry >= yardage) penalty -= 4;
+    }
+
+    if (options?.danger === "long is dead" || options?.danger === "back rough") {
+      if (carry > yardage) penalty += 18;
+      if (carry <= yardage) penalty -= 4;
+    }
+
+    if (options?.firmness === "firm" && carry > yardage) {
+      penalty += 6;
+    }
+
+    if (options?.targetBias === "favorLong" && carry < yardage) {
+      penalty += 8;
+    }
+
+    if (options?.targetBias === "favorShort" && carry > yardage) {
+      penalty += 8;
+    }
+
+    if (options?.windDir === "head" && options.windMph && options.windMph >= 12 && preferredShot !== "knockdownFade") {
+      penalty += 6;
+    }
+
+    if (options?.windDir === "tail" && options.windMph && options.windMph >= 12 && preferredShot === "knockdownFade") {
+      penalty += 3;
+    }
+
+    if (penalty < bestPenalty) {
+      bestPenalty = penalty;
       best = club;
     }
   }
 
-  return best;
+  return { club: best, penalty: bestPenalty };
 }
 
 function getRiskLineText(kind: string, start: number, width: number, severity: HazardSeverity) {
@@ -227,10 +269,11 @@ function chooseApproachShot(
   danger: string,
   preferred: Preferences["preferredApproachShape"]
 ): ShotType {
-  if (danger === "water short" || danger === "short false front") return "knockdownFade";
+  if (danger === "water short" || danger === "short false front" || danger === "front false edge") return "knockdownFade";
+  if (danger === "long is dead" && windDir === "tail") return "stock";
   if (firmness === "firm") return "knockdownFade";
   if (windDir === "head" && windMph >= 10) return "knockdownFade";
-  if (windDir === "tail" && windMph >= 10) return "stock";
+  if (windDir === "tail" && windMph >= 12) return "stock";
   return preferred as ShotType;
 }
 
@@ -346,11 +389,14 @@ function buildApproachScenario(clubs: Club[], preferences: Preferences, windDir:
 
   const adjusted = clamp(base + targetAdjustment + windAdjustmentYards(base, windDir, windMph), 70, 210);
   const shot = chooseApproachShot(windDir, windMph, greenFirmness, danger, preferences.preferredApproachShape);
-  const correctClub = pickBestClubForYardage(
+  const targetBias = danger === "water short" || danger === "short false front" ? "favorLong" : danger === "long is dead" ? "favorShort" : "neutral";
+  const clubDecision = pickBestClubForYardage(
     clubs.filter((c) => !["Driver", "3 Wood", "5 Wood"].includes(c.club)),
     adjusted,
-    shot
+    shot,
+    { danger, firmness: greenFirmness, windDir, windMph, targetBias }
   );
+  const correctClub = clubDecision.club;
   const prompt = `Hole: Par ${par}, ${holeYardage} yards. Target: ${targetLabel}. Raw carry to the flag is ${base}. Wind: ${windLabel(windDir, windMph)}. Pin: ${pinLocation}. Green firmness: ${greenFirmness}. Main danger: ${danger}. Using miss-based strategy, what is the best play?`;
 
   return {
@@ -364,7 +410,7 @@ function buildApproachScenario(clubs: Club[], preferences: Preferences, windDir:
     recommendation: `Hit a ${shot} with ${correctClub.club}`,
     correctClub: correctClub.club,
     correctShot: shot,
-    explanation: `The decision starts with the safest scoring target, not the flag by itself. Once the target is chosen, the yardage is adjusted for wind, firmness, and danger. Then the shot shape is chosen, and then the club. ${windTeachingText(windDir, adjusted, base)}`,
+    explanation: `The decision starts with the safest scoring target, not the flag by itself. Once the target is chosen, the yardage is adjusted for wind, firmness, and danger. Then the shot shape is chosen, and then the club. ${windTeachingText(windDir, adjusted, base)} Tour-level logic also asks where the safe miss is: short danger biases long, and long danger biases short.`,
     windDir,
     windMph,
     holeYardage,
@@ -392,11 +438,14 @@ function buildClubSelectionScenario(clubs: Club[], preferences: Preferences, win
 
   const adjusted = clamp(carryNumber + targetAdjustment + windAdjustmentYards(carryNumber, windDir, windMph), 65, 205);
   const shot = chooseApproachShot(windDir, windMph, greenFirmness, danger, preferences.preferredApproachShape);
-  const club = pickBestClubForYardage(
+  const targetBias = danger === "water short" || danger === "short bunker" || danger === "front false edge" ? "favorLong" : danger === "long is dead" || danger === "back rough" ? "favorShort" : "neutral";
+  const clubDecision = pickBestClubForYardage(
     clubs.filter((c) => !["Driver", "3 Wood", "5 Wood"].includes(c.club)),
     adjusted,
-    shot
+    shot,
+    { danger, firmness: greenFirmness, windDir, windMph, targetBias }
   );
+  const club = clubDecision.club;
 
   return {
     mode: "strict",
@@ -409,7 +458,7 @@ function buildClubSelectionScenario(clubs: Club[], preferences: Preferences, win
     recommendation: `Hit a ${shot} with ${club.club}`,
     correctClub: club.club,
     correctShot: shot,
-    explanation: `This mode is built specifically to punish short and long club mistakes. The correct answer comes from target first, adjusted yardage second, shot third, and club last. ${windTeachingText(windDir, adjusted, carryNumber)}`,
+    explanation: `This mode is built specifically to punish short and long club mistakes. The correct answer comes from target first, adjusted yardage second, shot third, and club last. ${windTeachingText(windDir, adjusted, carryNumber)} Tour-level logic scores the miss pattern, not just the nearest number.`,
     windDir,
     windMph,
     holeYardage,
@@ -526,7 +575,7 @@ export default function GolfCourseManagementQuizApp() {
   const [answerShot, setAnswerShot] = useState<ShotType | "">("");
   const [answerClub, setAnswerClub] = useState("");
   const [feedback, setFeedback] = useState<Feedback | null>(null);
-  const [score, setScore] = useState<{ correct: number; total: number }>(() => loadLocal("golf-app-score", { correct: 0, total: 0 }));
+  const [score, setScore] = useState<{ correct: number; total: number; streak: number; shortMisses: number; longMisses: number }>(() => loadLocal("golf-app-score", { correct: 0, total: 0, streak: 0, shortMisses: 0, longMisses: 0 }));
   const [tab, setTab] = useState("quiz");
 
   const clubNames = useMemo(() => clubs.map((c) => c.club), [clubs]);
@@ -570,7 +619,23 @@ export default function GolfCourseManagementQuizApp() {
     const clubCorrect = answerClub === scenario.correctClub;
     const shotCorrect = answerShot === scenario.correctShot;
     const isCorrect = clubCorrect && shotCorrect;
-    setScore((prev) => ({ correct: prev.correct + (isCorrect ? 1 : 0), total: prev.total + 1 }));
+    let missDirection: "short" | "long" | null = null;
+    setScore((prev) => {
+      if (!isCorrect && selectedClub) {
+        const selectedYards = answerShot ? getClubValueForShot(selectedClub, answerShot) : selectedClub.stock;
+        const target = scenario.targetYardage ?? selectedYards;
+        const delta = selectedYards - target;
+        if (delta <= -8) missDirection = "short";
+        if (delta >= 8) missDirection = "long";
+      }
+      return {
+        correct: prev.correct + (isCorrect ? 1 : 0),
+        total: prev.total + 1,
+        streak: isCorrect ? prev.streak + 1 : 0,
+        shortMisses: prev.shortMisses + (missDirection === "short" ? 1 : 0),
+        longMisses: prev.longMisses + (missDirection === "long" ? 1 : 0),
+      };
+    });
 
     const selectedClub = clubs.find((c) => c.club === answerClub);
     let missLabel = "";
@@ -607,7 +672,7 @@ export default function GolfCourseManagementQuizApp() {
       }
     }
 
-    setFeedback({ clubCorrect, shotCorrect, isCorrect, missLabel, wrongReason });
+    setFeedback({ clubCorrect, shotCorrect, isCorrect, missLabel, wrongReason, penaltyScore: isCorrect ? 0 : 1 });
   }
 
   return (
@@ -674,6 +739,10 @@ export default function GolfCourseManagementQuizApp() {
             <div className="score-grid">
               <div className="soft"><div className="muted" style={{ fontSize: 12 }}>Correct</div><div style={{ fontSize: 30, fontWeight: 700 }}>{score.correct}</div></div>
               <div className="soft"><div className="muted" style={{ fontSize: 12 }}>Total</div><div style={{ fontSize: 30, fontWeight: 700 }}>{score.total}</div></div>
+            </div>
+            <div className="pill-grid" style={{ marginTop: 14 }}>
+              <div className="soft"><div className="muted" style={{ fontSize: 12 }}>Streak</div><div style={{ fontSize: 24, fontWeight: 700 }}>{score.streak}</div></div>
+              <div className="soft"><div className="muted" style={{ fontSize: 12 }}>Short / Long Misses</div><div style={{ fontSize: 24, fontWeight: 700 }}>{score.shortMisses} / {score.longMisses}</div></div>
             </div>
             <div style={{ marginTop: 14 }}>
               <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}><span>Accuracy</span><strong>{pct}%</strong></div>
@@ -779,6 +848,7 @@ export default function GolfCourseManagementQuizApp() {
                   <div className="soft">4. Headwind makes the ball fly shorter, so the shot plays longer and usually needs more club.</div>
                   <div className="soft">5. Choose the shot shape that best fits the target and miss pattern, then choose the club last.</div>
                   <div className="soft">6. Punch shots use lower-lofted irons, not wedges.</div>
+                  <div className="soft">7. TOUR-level logic scores the safe miss, not just the closest carry number.</div>
                 </div>
               </div>
             </div>
@@ -881,6 +951,7 @@ export default function GolfCourseManagementQuizApp() {
                 <div className="soft">Adjusted yardage second</div>
                 <div className="soft">Shot shape third</div>
                 <div className="soft">Club last</div>
+                <div className="soft">Penalty logic rewards the safe miss and punishes short- or long-side disasters.</div>
                 <div className="soft">
                   <div style={{ fontWeight: 700, marginBottom: 8 }}>Sanity checks</div>
                   <ul>
