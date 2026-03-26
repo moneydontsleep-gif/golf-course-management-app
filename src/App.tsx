@@ -168,15 +168,22 @@ function getClubTotal(club: Club, shot: Exclude<ShotType, "punch">) {
   return club.totalStock ?? club.stock + 10;
 }
 
-function bestClubForDistance(clubs: Club[], target: number, shotType: ShotType, options?: { punchOnly?: boolean; excludeWoods?: boolean }) {
+function bestClubForDistance(
+  clubs: Club[],
+  target: number,
+  shotType: ShotType,
+  options?: { punchOnly?: boolean; excludeWoods?: boolean }
+) {
   let pool = clubs;
   if (options?.punchOnly) {
     pool = clubs.filter((club) => ["5 Iron", "6 Iron", "7 Iron", "8 Iron"].includes(club.club));
   } else if (options?.excludeWoods) {
     pool = clubs.filter((club) => !["Driver", "3 Wood", "5 Wood"].includes(club.club));
   }
+
   let best = pool[0];
   let diff = Infinity;
+
   for (const club of pool) {
     const selected = getClubValueForShot(club, shotType);
     const d = Math.abs(selected - target);
@@ -185,6 +192,24 @@ function bestClubForDistance(clubs: Club[], target: number, shotType: ShotType, 
       diff = d;
     }
   }
+
+  return best;
+}
+
+function pickBestClubForYardage(clubs: Club[], yardage: number, preferredShot: ShotType) {
+  let best = clubs[0];
+  let smallestDiff = Infinity;
+
+  for (const club of clubs) {
+    const carry = getClubValueForShot(club, preferredShot);
+    const diff = Math.abs(carry - yardage);
+
+    if (diff < smallestDiff) {
+      smallestDiff = diff;
+      best = club;
+    }
+  }
+
   return best;
 }
 
@@ -193,6 +218,20 @@ function getRiskLineText(kind: string, start: number, width: number, severity: H
   if (kind === "bunkers") return `Fairway bunkers begin around ${start} and squeeze the landing area to about ${width} yards.`;
   if (kind === "rough") return `The fairway narrows to about ${width} yards near ${start}, with thick rough waiting on the miss side.`;
   return `The landing zone pinches down around ${start}, leaving only about ${width} yards of real fairway. Severity: ${severity}.`;
+}
+
+function chooseApproachShot(
+  windDir: string,
+  windMph: number,
+  firmness: string,
+  danger: string,
+  preferred: Preferences["preferredApproachShape"]
+): ShotType {
+  if (danger === "water short" || danger === "short false front") return "knockdownFade";
+  if (firmness === "firm") return "knockdownFade";
+  if (windDir === "head" && windMph >= 10) return "knockdownFade";
+  if (windDir === "tail" && windMph >= 10) return "stock";
+  return preferred as ShotType;
 }
 
 function buildTeeScenario(clubs: Club[], preferences: Preferences, windDir: string, windMph: number): Scenario {
@@ -208,23 +247,29 @@ function buildTeeScenario(clubs: Club[], preferences: Preferences, windDir: stri
   const preferredDriverShot: Exclude<ShotType, "knockdownFade" | "punch"> = fairwaySide === "left"
     ? "fade"
     : fairwaySide === "right" && preferences.allowDrawOffTee
-    ? "draw"
-    : preferences.preferredTeeShape === "stock"
-    ? "stock"
-    : preferences.preferredTeeShape;
+      ? "draw"
+      : preferences.preferredTeeShape === "stock"
+        ? "stock"
+        : preferences.preferredTeeShape;
 
   const driverCarry = getClubValueForShot(driver, preferredDriverShot);
   const driverTotal = getClubTotal(driver, preferredDriverShot === "stock" ? "stock" : preferredDriverShot);
-  const layupClub = bestClubForDistance(clubs.filter((c) => !["Driver"].includes(c.club)), hazardStart - 18, preferences.preferredLayupShape);
+  const layupClub = bestClubForDistance(
+    clubs.filter((c) => c.club !== "Driver"),
+    hazardStart - 18,
+    preferences.preferredLayupShape
+  );
   const layupCarry = getClubValueForShot(layupClub, preferences.preferredLayupShape);
   const remainingIfLayup = holeYardage - layupCarry;
 
   const severePenalty = severity === "high" || hazardKind === "water";
-  const crosswindPenalty = (windDir === "leftToRight" || windDir === "rightToLeft") && windMph >= 12 && fairwayWidth <= 22;
-  const actualRunThroughRisk = driverTotal >= hazardStart - 2;
-  const actualCarryIntoRisk = driverCarry >= hazardStart && severePenalty;
-  const leaveTooLong = remainingIfLayup > 195;
-  const driverStillPlayable = !actualCarryIntoRisk && !(crosswindPenalty && severePenalty);
+  const narrowFairway = fairwayWidth <= 22;
+  const strongCrosswind = (windDir === "leftToRight" || windDir === "rightToLeft") && windMph >= 12;
+  const driverRunsIntoTrouble = driverTotal >= hazardStart - 2;
+  const driverCarriesIntoPenalty = driverCarry >= hazardStart && severePenalty;
+  const layupCreatesTooLongApproach = remainingIfLayup > 195;
+  const mustLayUp = severePenalty && (driverCarriesIntoPenalty || (driverRunsIntoTrouble && narrowFairway));
+  const crosswindLayup = severePenalty && strongCrosswind && narrowFairway && driverRunsIntoTrouble;
 
   let correctClub = driver.club;
   let correctShot: ShotType = preferredDriverShot;
@@ -232,15 +277,18 @@ function buildTeeScenario(clubs: Club[], preferences: Preferences, windDir: stri
   let whyRisky = getRiskLineText(hazardKind, hazardStart, fairwayWidth, severity);
   const reasoning: string[] = [];
 
-  if ((actualRunThroughRisk || actualCarryIntoRisk || crosswindPenalty) && (!leaveTooLong || !driverStillPlayable)) {
+  if ((mustLayUp || crosswindLayup) && !layupCreatesTooLongApproach) {
     correctClub = layupClub.club;
     correctShot = preferences.preferredLayupShape;
     targetLabel = "Safe fairway section short of the hazard line";
-    reasoning.push("The primary goal is staying short of the actual trouble line with a full fairway target.");
-    reasoning.push("This is one of the few cases where the penalty for using driver is real enough to justify sacrificing distance.");
+    reasoning.push("This is a true layup situation because driver reaches real penalty trouble, not just vague discomfort.");
+    reasoning.push("The layup still leaves a manageable next shot, so distance is worth giving up here.");
   } else {
-    reasoning.push("The target should be chosen first, then the yardage window, then the shot, then the club.");
-    reasoning.push("Even though there is some risk, laying too far back would create a worse scoring position on the next shot.");
+    reasoning.push("The target is chosen first, then the landing window, then the shot shape, then the club.");
+    reasoning.push("Distance still matters. A shorter club is not correct if it creates an unnecessarily long and weaker approach.");
+    if (mustLayUp || crosswindLayup) {
+      reasoning.push("Even though there is danger ahead, the layup would leave too much into the green, so a controlled driver is the better scoring play.");
+    }
   }
 
   const prompt = `Hole: Par ${par}, ${holeYardage} yards. Target: ${targetLabel}. Wind: ${windLabel(windDir, windMph)}. Fairway favors the ${fairwaySide}. Risk line: ${whyRisky} Driver ${preferredDriverShot} carries about ${driverCarry} and finishes around ${driverTotal}. A ${layupClub.club} ${preferences.preferredLayupShape} carries about ${layupCarry}. What is the best play?`;
@@ -252,8 +300,8 @@ function buildTeeScenario(clubs: Club[], preferences: Preferences, windDir: stri
     title: "Tee Shot Decision",
     prompt,
     targetLabel,
-    adjustedYardageLabel: correctClub === driver.club ? `Landing window starts around ${hazardStart}` : `Stay short of ${hazardStart}`,
-    recommendation: `${correctShot === preferences.preferredLayupShape && correctClub !== driver.club ? "Play" : "Hit"} a ${correctShot} with ${correctClub}`,
+    adjustedYardageLabel: correctClub === driver.club ? `Primary landing window begins near ${hazardStart}` : `Stay short of ${hazardStart}`,
+    recommendation: `${correctClub === driver.club ? "Hit" : "Play"} a ${correctShot} with ${correctClub}`,
     correctClub,
     correctShot,
     explanation: reasoning.join(" "),
@@ -279,24 +327,30 @@ function buildApproachScenario(clubs: Club[], preferences: Preferences, windDir:
 
   if (danger === "water short" || danger === "short false front") {
     targetLabel = pinLocation === "front" ? "Front-middle safety number" : "Middle of green";
-    targetAdjustment = 4;
-  } else if (danger === "long is dead") {
-    targetLabel = pinLocation === "back" ? "Middle number, stay under the hole" : "Middle of green";
-    targetAdjustment = -4;
-  } else if (pinLocation === "back") {
-    targetLabel = "Back-middle number";
-    targetAdjustment = 3;
-  } else if (pinLocation === "front") {
-    targetLabel = "Front-middle number";
-    targetAdjustment = -2;
+    targetAdjustment += 4;
   }
-
+  if (danger === "long is dead") {
+    targetLabel = pinLocation === "back" ? "Middle number, stay under the hole" : "Middle of green";
+    targetAdjustment -= 4;
+  }
+  if (pinLocation === "back") {
+    targetLabel = targetLabel === "Middle of green" ? "Back-middle number" : targetLabel;
+    targetAdjustment += 2;
+  }
+  if (pinLocation === "front" && danger !== "water short" && danger !== "short false front") {
+    targetLabel = targetLabel === "Middle of green" ? "Front-middle number" : targetLabel;
+    targetAdjustment -= 2;
+  }
   if (greenFirmness === "firm") targetAdjustment -= 2;
   if (greenFirmness === "soft") targetAdjustment += 1;
 
   const adjusted = clamp(base + targetAdjustment + windAdjustmentYards(base, windDir, windMph), 70, 210);
-  const shot = preferences.preferredApproachShape as ShotType;
-  const correctClub = bestClubForDistance(clubs, adjusted, shot, { excludeWoods: true });
+  const shot = chooseApproachShot(windDir, windMph, greenFirmness, danger, preferences.preferredApproachShape);
+  const correctClub = pickBestClubForYardage(
+    clubs.filter((c) => !["Driver", "3 Wood", "5 Wood"].includes(c.club)),
+    adjusted,
+    shot
+  );
   const prompt = `Hole: Par ${par}, ${holeYardage} yards. Target: ${targetLabel}. Raw carry to the flag is ${base}. Wind: ${windLabel(windDir, windMph)}. Pin: ${pinLocation}. Green firmness: ${greenFirmness}. Main danger: ${danger}. Using miss-based strategy, what is the best play?`;
 
   return {
@@ -333,12 +387,16 @@ function buildClubSelectionScenario(clubs: Club[], preferences: Preferences, win
   if (danger === "water short" || danger === "front false edge") targetAdjustment += 4;
   if (danger === "long is dead") targetAdjustment -= 4;
   if (pinLocation === "back") targetAdjustment += 2;
-  if (pinLocation === "front") targetAdjustment -= 2;
+  if (pinLocation === "front" && danger !== "water short" && danger !== "front false edge") targetAdjustment -= 2;
   if (greenFirmness === "firm") targetAdjustment -= 2;
 
   const adjusted = clamp(carryNumber + targetAdjustment + windAdjustmentYards(carryNumber, windDir, windMph), 65, 205);
-  const shot = preferences.preferredApproachShape as ShotType;
-  const club = bestClubForDistance(clubs, adjusted, shot, { excludeWoods: true });
+  const shot = chooseApproachShot(windDir, windMph, greenFirmness, danger, preferences.preferredApproachShape);
+  const club = pickBestClubForYardage(
+    clubs.filter((c) => !["Driver", "3 Wood", "5 Wood"].includes(c.club)),
+    adjusted,
+    shot
+  );
 
   return {
     mode: "strict",
@@ -445,6 +503,7 @@ function runSanityChecks() {
     { name: "Every scenario has a target label", pass: results.every((s) => !!s.targetLabel) },
     { name: "Every scenario has a recommendation", pass: results.every((s) => !!s.recommendation) },
     { name: "Recovery uses punch only", pass: results.filter((s) => s.type === "recovery").every((s) => s.correctShot === "punch") },
+    { name: "Approach and club selection use the club picker", pass: results.filter((s) => s.type === "approach" || s.type === "clubSelection").length > 0 },
   ];
 }
 
