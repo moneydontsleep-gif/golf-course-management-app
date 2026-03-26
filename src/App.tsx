@@ -183,8 +183,21 @@ function bestClubForDistance(clubs: Club[], target: number, shotType: ShotType, 
     if (d < diff) {
       best = club;
       diff = d;
+
+function pickBestClubForYardage(clubs: Club[], yardage: number, preferredShot: ShotType) {
+  let best = clubs[0];
+  let smallestDiff = Infinity;
+
+  for (const club of clubs) {
+    const carry = getClubValueForShot(club, preferredShot);
+    const diff = Math.abs(carry - yardage);
+
+    if (diff < smallestDiff) {
+      smallestDiff = diff;
+      best = club;
     }
   }
+
   return best;
 }
 
