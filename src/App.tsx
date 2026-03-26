@@ -277,6 +277,14 @@ function chooseApproachShot(
   return preferred as ShotType;
 }
 
+function chooseRecoveryShot(lie: string, opening: string): { shot: ShotType; takeMedicine: boolean } {
+  const veryRestricted = lie === "under tree limbs" || opening === "small window back to fairway";
+  if (veryRestricted) {
+    return { shot: "punch", takeMedicine: true };
+  }
+  return { shot: "punch", takeMedicine: false };
+}
+
 function buildTeeScenario(clubs: Club[], preferences: Preferences, windDir: string, windMph: number): Scenario {
   const holeYardage = randomFrom([392, 405, 418, 428, 438, 452]);
   const par = holeYardage >= 445 ? 5 : 4;
@@ -304,6 +312,7 @@ function buildTeeScenario(clubs: Club[], preferences: Preferences, windDir: stri
   );
   const layupCarry = getClubValueForShot(layupClub, preferences.preferredLayupShape);
   const remainingIfLayup = holeYardage - layupCarry;
+  const remainingIfDriver = holeYardage - driverTotal;
 
   const severePenalty = severity === "high" || hazardKind === "water";
   const narrowFairway = fairwayWidth <= 22;
@@ -311,6 +320,7 @@ function buildTeeScenario(clubs: Club[], preferences: Preferences, windDir: stri
   const driverRunsIntoTrouble = driverTotal >= hazardStart - 2;
   const driverCarriesIntoPenalty = driverCarry >= hazardStart && severePenalty;
   const layupCreatesTooLongApproach = remainingIfLayup > 195;
+  const driverCreatesStrongScoringEdge = remainingIfDriver <= 185;
   const mustLayUp = severePenalty && (driverCarriesIntoPenalty || (driverRunsIntoTrouble && narrowFairway));
   const crosswindLayup = severePenalty && strongCrosswind && narrowFairway && driverRunsIntoTrouble;
 
@@ -320,21 +330,21 @@ function buildTeeScenario(clubs: Club[], preferences: Preferences, windDir: stri
   let whyRisky = getRiskLineText(hazardKind, hazardStart, fairwayWidth, severity);
   const reasoning: string[] = [];
 
-  if ((mustLayUp || crosswindLayup) && !layupCreatesTooLongApproach) {
+  if ((mustLayUp || crosswindLayup) && !layupCreatesTooLongApproach && !driverCreatesStrongScoringEdge) {
     correctClub = layupClub.club;
     correctShot = preferences.preferredLayupShape;
     targetLabel = "Safe fairway section short of the hazard line";
     reasoning.push("This is a true layup situation because driver reaches real penalty trouble, not just vague discomfort.");
-    reasoning.push("The layup still leaves a manageable next shot, so distance is worth giving up here.");
+    reasoning.push("One-shot-ahead logic still matters, but avoiding a penalty here outweighs the extra distance.");
   } else {
     reasoning.push("The target is chosen first, then the landing window, then the shot shape, then the club.");
-    reasoning.push("Distance still matters. A shorter club is not correct if it creates an unnecessarily long and weaker approach.");
+    reasoning.push("TOUR-level logic thinks one shot ahead. A shorter club is not correct if it creates an unnecessarily long and weaker approach.");
     if (mustLayUp || crosswindLayup) {
       reasoning.push("Even though there is danger ahead, the layup would leave too much into the green, so a controlled driver is the better scoring play.");
     }
   }
 
-  const prompt = `Hole: Par ${par}, ${holeYardage} yards. Target: ${targetLabel}. Wind: ${windLabel(windDir, windMph)}. Fairway favors the ${fairwaySide}. Risk line: ${whyRisky} Driver ${preferredDriverShot} carries about ${driverCarry} and finishes around ${driverTotal}. A ${layupClub.club} ${preferences.preferredLayupShape} carries about ${layupCarry}. What is the best play?`;
+  const prompt = `Hole: Par ${par}, ${holeYardage} yards. Target: ${targetLabel}. Wind: ${windLabel(windDir, windMph)}. Fairway favors the ${fairwaySide}. Risk line: ${whyRisky} Driver ${preferredDriverShot} carries about ${driverCarry} and finishes around ${driverTotal}. A ${layupClub.club} ${preferences.preferredLayupShape} carries about ${layupCarry}. One-shot-ahead reminder: driver would leave about ${remainingIfDriver}, while the layup leaves about ${remainingIfLayup}. What is the best play?`;
 
   return {
     mode: "strict",
@@ -476,22 +486,27 @@ function buildRecoveryScenario(clubs: Club[], windDir: string, windMph: number):
   const opening = randomFrom(["low punch lane", "small window back to fairway", "half-window to safe angle"] as const);
   const safeLeave = randomFrom([80, 90, 100, 110]);
   const targetAdvance = Math.max(remaining - safeLeave, 45);
-  const correctShot: ShotType = "punch";
+  const recoveryDecision = chooseRecoveryShot(lie, opening);
+  const correctShot: ShotType = recoveryDecision.shot;
   const correctClub = bestClubForDistance(clubs, targetAdvance, "punch", { punchOnly: true });
-  const targetLabel = `Advance the ball low to leave about ${safeLeave}`;
+  const targetLabel = recoveryDecision.takeMedicine
+    ? `Take your medicine: advance low to leave about ${safeLeave}`
+    : `Advance the ball low to leave about ${safeLeave}`;
 
   return {
     mode: "recovery",
     type: "recovery",
     category: "Scramble / Recovery",
-    title: "Recovery Decision",
+    title: recoveryDecision.takeMedicine ? "Recovery Decision — Take Your Medicine" : "Recovery Decision",
     prompt: `Hole: Par ${par}, ${holeYardage} yards. Target: ${targetLabel}. You have ${remaining} left. Lie: ${lie}. Escape window: ${opening}. Wind: ${windLabel(windDir, windMph)}. What is the best play?`,
     targetLabel,
     adjustedYardageLabel: `Advance about ${targetAdvance}`,
     recommendation: `Play a punch with ${correctClub.club}`,
     correctClub: correctClub.club,
     correctShot,
-    explanation: `Recovery mode allows flexibility, but only within disciplined boundaries. A punch shot should use a lower-lofted club that launches low and advances predictably.`,
+    explanation: recoveryDecision.takeMedicine
+      ? `This is a major-trouble situation. TOUR-level logic says take your medicine, get the ball back in play, and protect the scorecard instead of forcing a hero shot.`
+      : `Recovery mode allows flexibility, but only within disciplined boundaries. A punch shot should use a lower-lofted club that launches low and advances predictably.`,
     windDir,
     windMph,
     holeYardage,
@@ -849,6 +864,7 @@ export default function GolfCourseManagementQuizApp() {
                   <div className="soft">5. Choose the shot shape that best fits the target and miss pattern, then choose the club last.</div>
                   <div className="soft">6. Punch shots use lower-lofted irons, not wedges.</div>
                   <div className="soft">7. TOUR-level logic scores the safe miss, not just the closest carry number.</div>
+                  <div className="soft">8. In major trouble, the app should favor a take-your-medicine recovery instead of a hero shot.</div>
                 </div>
               </div>
             </div>
@@ -952,6 +968,7 @@ export default function GolfCourseManagementQuizApp() {
                 <div className="soft">Shot shape third</div>
                 <div className="soft">Club last</div>
                 <div className="soft">Penalty logic rewards the safe miss and punishes short- or long-side disasters.</div>
+                <div className="soft">One-shot-ahead logic matters in normal situations, but major trouble still defaults to take-your-medicine golf.</div>
                 <div className="soft">
                   <div style={{ fontWeight: 700, marginBottom: 8 }}>Sanity checks</div>
                   <ul>
