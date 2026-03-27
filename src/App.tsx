@@ -630,6 +630,19 @@ export default function GolfCourseManagementQuizApp() {
     setFeedback(null);
   }
 
+  function resetScore() {
+    const confirmed = window.confirm("Are you sure you want to reset your score and stats?");
+    if (!confirmed) return;
+
+    setScore({
+      correct: 0,
+      total: 0,
+      streak: 0,
+      shortMisses: 0,
+      longMisses: 0,
+    });
+  }
+
   function submitAnswer() {
     const clubCorrect = answerClub === scenario.correctClub;
     const shotCorrect = answerShot === scenario.correctShot;
@@ -762,6 +775,23 @@ export default function GolfCourseManagementQuizApp() {
             <div style={{ marginTop: 14 }}>
               <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}><span>Accuracy</span><strong>{pct}%</strong></div>
               <div className="progress-wrap"><div className="progress-bar" style={{ width: `${pct}%` }} /></div>
+            </div>
+            <div style={{ marginTop: 14, display: "flex", justifyContent: "flex-end" }}>
+              <button
+                onClick={resetScore}
+                className="btn btn-secondary"
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 8,
+                  padding: "10px 16px",
+                  borderRadius: 12,
+                  fontWeight: 700,
+                }}
+              >
+                <RefreshCw size={16} />
+                Reset Score
+              </button>
             </div>
             <div className="soft" style={{ marginTop: 16 }}>The app now starts with target and adjusted number first, so the logic matches real tournament golf more closely.</div>
           </div>
